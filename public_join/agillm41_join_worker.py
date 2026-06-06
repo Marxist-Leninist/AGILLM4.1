@@ -173,6 +173,17 @@ def run_worker(args: argparse.Namespace, lease: dict[str, Any], package: Path, f
         raise RuntimeError(f"worker did not create {out}")
 
 
+def get_balance(coordinator_url: str, participant_id: str, insecure: bool) -> dict[str, Any] | None:
+    if not participant_id:
+        return None
+    url = urljoin(coordinator_url.rstrip("/") + "/", f"api/v1/points/{participant_id}")
+    try:
+        with urlopen(Request(url), context=ssl_context(insecure), timeout=30) as r:
+            return json.loads(r.read() or b"{}")
+    except Exception:
+        return None
+
+
 def once(args: argparse.Namespace) -> bool:
     workdir = Path(args.workdir)
     cache_dir = workdir / "cache"
@@ -192,6 +203,7 @@ def once(args: argparse.Namespace) -> bool:
                 "threads": args.threads,
                 "vchunk": args.vchunk,
                 "max_result_bytes": args.max_result_bytes,
+                "participant_id": getattr(args, "participant_id", ""),
                 "machine": getattr(args, "machine", {}),
             },
         },
@@ -224,6 +236,11 @@ def once(args: argparse.Namespace) -> bool:
         ),
         flush=True,
     )
+    bal = get_balance(args.coordinator_url, getattr(args, "participant_id", ""), args.insecure)
+    if bal is not None:
+        print(json.dumps({"event": "points", "participant_id": bal.get("participant_id"),
+                          "points": bal.get("points"), "accepted": bal.get("accepted"),
+                          "note": "credited after server-side validation"}), flush=True)
     return True
 
 
@@ -278,6 +295,7 @@ def main() -> int:
     ap.add_argument("--node-id", default=os.environ.get("AGILLM41_NODE_ID") or os.environ.get("AGILLM35_NODE_ID", ""))
     ap.add_argument("--join-code", default=os.environ.get("AGILLM41_JOIN_CODE", ""))
     ap.add_argument("--device", default="auto", help="auto|cpu|cuda|directml (auto detects the best backend)")
+    ap.add_argument("--participant-id", default=os.environ.get("AGILLM41_PARTICIPANT_ID", ""), help="stable id to accrue contribution points; auto-generated + persisted if unset")
     ap.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--vchunk", type=int, default=4096)
@@ -301,6 +319,21 @@ def main() -> int:
     args.machine["device"] = args.device
     args.machine["threads"] = args.threads
     print(json.dumps({"event": "machine", **args.machine}), flush=True)
+    if not args.participant_id:
+        pid_file = Path(args.workdir) / "participant_id.txt"
+        try:
+            args.participant_id = pid_file.read_text().strip()
+        except Exception:
+            args.participant_id = ""
+        if not args.participant_id:
+            import secrets as _secrets
+            args.participant_id = "pid_" + _secrets.token_urlsafe(18)
+            try:
+                pid_file.parent.mkdir(parents=True, exist_ok=True)
+                pid_file.write_text(args.participant_id)
+            except Exception:
+                pass
+    print(json.dumps({"event": "participant", "participant_id": args.participant_id}), flush=True)
     if not args.coordinator_url:
         raise SystemExit("set --coordinator-url or AGILLM41_COORDINATOR_URL")
     while True:

@@ -26,6 +26,32 @@ from urllib.parse import urlparse
 
 
 VERSION = "2026-06-02"
+
+try:
+    from agillm41_points import Ledger as _Ledger
+except Exception:  # ledger optional; endpoints degrade gracefully
+    _Ledger = None
+
+
+def _ledger():
+    return _Ledger() if _Ledger is not None else None
+
+
+def _network_stats(store) -> dict:
+    sp = store.spool
+    led = _ledger()
+    data = led._read() if led else {}
+    g = lambda name: len(list((sp / name).glob("*.json")))
+    return {
+        "version": VERSION,
+        "leases_available": g("available"),
+        "leases_active": g("leased"),
+        "contributions_accepted": g("accepted"),
+        "contributions_quarantined": g("quarantine"),
+        "contributors": len(data),
+        "points_outstanding": round(sum(v.get("points", 0) for v in data.values()), 2),
+        "points_earned_total": round(sum(v.get("earned", 0) for v in data.values()), 2),
+    }
 MAX_JSON = 256 * 1024
 
 
@@ -283,6 +309,18 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self.send_json(200, {"ok": True, "version": VERSION})
+            return
+        if parsed.path == "/api/v1/stats":
+            self.send_json(200, _network_stats(self.store))
+            return
+        if parsed.path == "/api/v1/leaderboard":
+            led = _ledger()
+            self.send_json(200, {"leaderboard": led.leaderboard() if led else []})
+            return
+        if parsed.path.startswith("/api/v1/points/"):
+            pid = parsed.path.split("/api/v1/points/", 1)[1].strip("/")
+            led = _ledger()
+            self.send_json(200, {"participant_id": pid, **(led.account(pid) if led else {})})
             return
         parts = parsed.path.strip("/").split("/")
         if len(parts) == 5 and parts[:3] == ["api", "v1", "leases"]:

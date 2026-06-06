@@ -228,3 +228,32 @@ python public_join/agillm41_join_worker.py \
   --join-code test-code \
   --device cpu
 ```
+
+
+## Contribution Points
+
+Helping train earns **contribution points**, and points will be redeemable for
+**distributed inference of the latest model** (the reason to contribute is that
+you get to use what you help build).
+
+- The worker auto-generates a stable `participant_id` on first run and persists
+  it in `<workdir>/participant_id.txt` (override with `--participant-id` or
+  `AGILLM41_PARTICIPANT_ID`). It is an opaque token, not personal information.
+- Every accepted contribution prints a `{"event": "points", ...}` line so you
+  can watch your balance grow.
+- Points are credited **only after server-side validation** of your submitted
+  update (finite values, bounded norm, structural sanity). Invalid or junk
+  uploads earn nothing. Validation loads untrusted tensors with
+  `weights_only=True` only - it never executes uploaded pickles.
+
+### Check your balance / the network
+
+```bash
+curl https://join.opentransformers.online/api/v1/points/<your-participant-id>
+curl https://join.opentransformers.online/api/v1/leaderboard
+curl https://join.opentransformers.online/api/v1/stats
+```
+
+Earning rate is currently `10` points per accepted contribution plus a small
+per-token bonus; redemption pricing for inference is published when the inference
+endpoint goes live.

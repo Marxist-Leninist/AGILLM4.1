@@ -25,6 +25,8 @@ example.
 
 ### What A Helper Runs
 
+By default the worker runs `--device auto`: it detects CUDA, then DirectML, else CPU, sizes threads to your machine, and reports a hardware profile (GPU name, VRAM, cores, RAM) to the coordinator. Pass `--device cuda`, `--device directml`, or `--device cpu` to force one.
+
 Linux/macOS:
 
 ```bash

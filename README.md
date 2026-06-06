@@ -20,6 +20,13 @@ inference is AR-first today; monolithic runtime inference supports `--mode ar`,
 
 ## Public Join Scripts
 
+Live coordinator (Scott's network):
+
+- URL: `https://join.opentransformers.online`
+- Health: <https://join.opentransformers.online/health>
+- Status: no join code currently required. Volunteer workers only need outbound HTTPS.
+- Untrusted results land in server-side quarantine and are validated before they can affect the live checkpoint. Volunteers never receive credentials and never SSH in.
+
 `public_join/agillm41_network_host.py` starts a signed-lease HTTPS coordinator for people who want to run their own network.
 
 `public_join/agillm41_join_worker.py` is an outbound-only worker for untrusted joiners. It requests short-lived leases, verifies package hashes, runs a local worker command, and submits results to quarantine rather than exposing SSH or writing directly into the master merge path.

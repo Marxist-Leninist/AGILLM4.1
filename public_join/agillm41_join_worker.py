@@ -284,6 +284,20 @@ def characterize_machine() -> dict[str, Any]:
                 pass
     except Exception as exc:
         prof["torch_error"] = str(exc)[:200]
+    if "gpu" not in prof:
+        # fallback: CUDA may not be ready in torch at boot; ask nvidia-smi directly
+        try:
+            import subprocess
+            out = subprocess.run(["nvidia-smi","--query-gpu=name,memory.total","--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=8).stdout.strip().splitlines()
+            if out:
+                name, mem = (out[0].split(",")+["",""])[:2]
+                prof["gpu"] = name.strip()
+                try: prof["gpu_vram_gb"] = round(float(mem)/1024, 1)
+                except Exception: pass
+                if best == "cpu": best = "cuda"
+        except Exception:
+            pass
     prof["best_device"] = best
     return prof
 

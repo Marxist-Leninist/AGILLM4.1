@@ -11,6 +11,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 from pathlib import Path
 import socket
 import ssl
@@ -191,6 +192,7 @@ def once(args: argparse.Namespace) -> bool:
                 "threads": args.threads,
                 "vchunk": args.vchunk,
                 "max_result_bytes": args.max_result_bytes,
+                "machine": getattr(args, "machine", {}),
             },
         },
         args.insecure,
@@ -225,13 +227,57 @@ def once(args: argparse.Namespace) -> bool:
     return True
 
 
+def characterize_machine() -> dict[str, Any]:
+    """Best-effort hardware profile + best available training backend.
+
+    No hard dependency on torch: if torch is missing we fall back to cpu and
+    record the import error so the coordinator can see why.
+    """
+    prof: dict[str, Any] = {
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "cpu_count": os.cpu_count() or 1,
+    }
+    try:
+        if hasattr(os, "sysconf") and "SC_PHYS_PAGES" in os.sysconf_names:
+            prof["ram_gb"] = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1)
+    except Exception:
+        pass
+    best = "cpu"
+    try:
+        import torch
+        prof["torch"] = torch.__version__
+        if torch.cuda.is_available():
+            best = "cuda"
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            prof["gpu"] = props.name
+            prof["gpu_vram_gb"] = round(props.total_memory / 1e9, 1)
+            prof["gpu_count"] = torch.cuda.device_count()
+            prof["cuda"] = torch.version.cuda
+        else:
+            try:
+                import torch_directml
+                if torch_directml.is_available():
+                    best = "directml"
+                    try:
+                        prof["gpu"] = torch_directml.device_name(0)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception as exc:
+        prof["torch_error"] = str(exc)[:200]
+    prof["best_device"] = best
+    return prof
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="AGILLM4.1 outbound-only untrusted join worker")
     ap.add_argument("--coordinator-url", default=os.environ.get("AGILLM41_COORDINATOR_URL") or os.environ.get("AGILLM35_COORDINATOR_URL", ""))
     ap.add_argument("--workdir", default=os.environ.get("AGILLM41_JOIN_WORKDIR") or "./agillm41_join_work")
     ap.add_argument("--node-id", default=os.environ.get("AGILLM41_NODE_ID") or os.environ.get("AGILLM35_NODE_ID", ""))
     ap.add_argument("--join-code", default=os.environ.get("AGILLM41_JOIN_CODE", ""))
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--device", default="auto", help="auto|cpu|cuda|directml (auto detects the best backend)")
     ap.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--vchunk", type=int, default=4096)
@@ -246,6 +292,15 @@ def main() -> int:
     ap.add_argument("--sleep-sec", type=int, default=30)
     ap.add_argument("--insecure", action="store_true", help="allow invalid TLS certs; test only")
     args = ap.parse_args()
+    args.machine = characterize_machine()
+    if args.device == "auto":
+        args.device = args.machine["best_device"]
+        cores = args.machine["cpu_count"]
+        # GPU hosts can use all cores for dataloading; CPU hosts keep half free
+        args.threads = cores if args.device != "cpu" else max(1, cores // 2)
+    args.machine["device"] = args.device
+    args.machine["threads"] = args.threads
+    print(json.dumps({"event": "machine", **args.machine}), flush=True)
     if not args.coordinator_url:
         raise SystemExit("set --coordinator-url or AGILLM41_COORDINATOR_URL")
     while True:

@@ -64,18 +64,21 @@ cycle_once() {
   out_dir="$ROUND_ROOT/$base"
   mkdir -p "$out_dir"
   cd "$MAINLINE"
-  python agillm4/training_bench/agillm4_export_bench_packages.py \
-    --ckpt "$ckpt" \
-    --out-dir "$out_dir" \
-    --workers "$WORKERS_SPEC" \
-    --steps 1 --batch-size 1 --block-size 128 \
-    --runtime agillm41.py --source __default__ \
-    --attn-backend sublinear \
-    --sublinear-window 128 --sublinear-stride 128 --sublinear-max-anchors 128 --sublinear-chunk 128 \
-    --sublinear-sinks 4 --sublinear-recent-anchors 64 \
-    --objective-mode stochastic --ar-prob 0.70 --sat-prob 0.15 --nat-prob 0.15 \
-    --ar-loss-tokens 64 --sat-loss-tokens 0 --nat-loss-tokens 64 \
-    --nat-mask-ratio 0.5 --nat-max-tokens 128
+  # device/RAM-adaptive per-CPU-worker export (each node sized to its RAM via lease_decide)
+  for _spec in geth:0 mcp:1 prime:2 communist-web:3; do
+    _wn="${_spec%%:*}"
+    read _cb _cblk < <(python3 /workspace/agillm41_lease_decide.py "$_wn" 2>/dev/null)
+    [ -z "$_cb" ] && _cb=1; [ -z "$_cblk" ] && _cblk=128
+    python agillm4/training_bench/agillm4_export_bench_packages.py \
+      --ckpt "$ckpt" --out-dir "$out_dir" --workers "$_spec" \
+      --steps 1 --batch-size "$_cb" --block-size "$_cblk" \
+      --runtime agillm41.py --source __default__ --attn-backend sublinear \
+      --sublinear-window 128 --sublinear-stride 128 --sublinear-max-anchors 128 --sublinear-chunk 128 \
+      --sublinear-sinks 4 --sublinear-recent-anchors 64 \
+      --objective-mode stochastic --ar-prob 0.70 --sat-prob 0.15 --nat-prob 0.15 \
+      --ar-loss-tokens 64 --sat-loss-tokens 0 --nat-loss-tokens 64 \
+      --nat-mask-ratio 0.5 --nat-max-tokens "$_cblk" || true
+  done
   copy_to_geth "$out_dir" "$base"
   ssh -i "$GETH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no "$GETH_HOST" \
     "cd '$GETH_WORKER_ROOT' && AGILLM41_SIDE_THREADS='$THREADS' AGILLM41_SMALL_NODE_THREADS='$SMALL_NODE_THREADS' bash ./agillm41_dispatch_side_round.sh '$base'"

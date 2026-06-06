@@ -35,6 +35,13 @@ def base_cap(v):  # (start_batch, max_batch) at block=1300
     if v>0:   return 2,3
     return 1,1
 
+CPU_RAM = {"geth":30,"mcp":3,"prime":3,"communist-web":3}  # measured; node->GB
+def cpu_dims(ram):
+    if ram>=24: return 2,768   # big-RAM CPU (e.g. geth 30G)
+    if ram>=8:  return 1,512
+    if ram>=4:  return 1,256
+    return 1,128               # 3GB nodes
+
 def worker_gpu(w):
     try:
         out=subprocess.run(["ssh","-i",GK,"-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
@@ -65,7 +72,7 @@ def decide(w):
     rec=st.get(w,{}); cur=rec.get("batch",start); prev_tokps=rec.get("tokps"); prev_batch=rec.get("batch")
     tokps=latest_tokps(w)
     if v==0:
-        nb,blk=1,128
+        nb,blk=cpu_dims(CPU_RAM.get(w,3))
     else:
         blk=BLOCK
         if tokps is None:

@@ -16,7 +16,7 @@ You need Scott's public coordinator URL. Scott may also publish a join code, but
 the join code is optional. It is an abuse-control gate, not the security model.
 
 - `AGILLM41_COORDINATOR_URL`: the public HTTPS endpoint, for example
-  `https://join.example.com`.
+  `https://join.opentransformers.online`.
 - `AGILLM41_JOIN_CODE`: optional. Use it only if Scott says the current
   coordinator requires one.
 
@@ -34,7 +34,7 @@ python -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip torch
 
-export AGILLM41_COORDINATOR_URL="https://join.example.com"
+export AGILLM41_COORDINATOR_URL="https://join.opentransformers.online"
 
 python public_join/agillm41_join_worker.py \
   --coordinator-url "$AGILLM41_COORDINATOR_URL" \
@@ -60,7 +60,7 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip torch
 
-$env:AGILLM41_COORDINATOR_URL = "https://join.example.com"
+$env:AGILLM41_COORDINATOR_URL = "https://join.opentransformers.online"
 
 .\public_join\join_scotts_network.example.ps1 -Device cpu -Threads 2
 ```
@@ -141,12 +141,12 @@ python public_join/agillm41_network_host.py serve \
 Use a join code to reduce random internet spam, result-flooding, disk fill,
 and bandwidth waste. Do not treat it as a trust boundary.
 
-If you own a domain, point a DNS record such as `join.example.com` at the
+If you own a domain, point a DNS record such as `join.opentransformers.online` at the
 coordinator host, open TCP 443, and put a TLS reverse proxy in front of the
 Python service. Caddy is the shortest path:
 
 ```caddyfile
-join.example.com {
+join.opentransformers.online {
   reverse_proxy 127.0.0.1:8787
 }
 ```
@@ -157,7 +157,7 @@ Then run the coordinator bound to localhost:
 python public_join/agillm41_network_host.py serve \
   --host 127.0.0.1 \
   --port 8787 \
-  --public-base-url https://join.example.com \
+  --public-base-url https://join.opentransformers.online \
   --join-code-file ./join_code.txt \
   --allow-http
 ```

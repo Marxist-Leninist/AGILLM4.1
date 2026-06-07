@@ -148,8 +148,8 @@ def global_block_state(local_state: dict[str, Any], layers: list[int]) -> dict[s
 
 def make_args(rargs: dict[str, Any]) -> SimpleNamespace:
     values = {
-        "amp": False,
-        "grad_checkpoint": False,
+        "amp": True,
+        "grad_checkpoint": True,
         "no_structured_masks": False,
         "dblock_blocks": 1,
         "dblock_schedule": "roundrobin",
@@ -174,7 +174,7 @@ def make_args(rargs: dict[str, Any]) -> SimpleNamespace:
         "dblock_sat_prob": 0.15,
         "dblock_nat_prob": 0.15,
         "dblock_log_every": 1,
-        "dblock_checkpoint_stride": 0,
+        "dblock_checkpoint_stride": 1,
         "dblock_checkpoint_skip_tail": 0,
         "dblock_activation_offload": False,
         "dblock_activation_offload_min_mb": 1.0,

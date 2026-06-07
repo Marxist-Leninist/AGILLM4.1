@@ -157,6 +157,36 @@ def run_worker(args: argparse.Namespace, lease: dict[str, Any], package: Path, f
     env["MKL_NUM_THREADS"] = threads
     env["OPENBLAS_NUM_THREADS"] = threads
     env.setdefault("TOKENIZER_ID", "deepseek-ai/DeepSeek-V4-Pro")
+
+    # --- VRAM-adaptive diffusion-block attention chunk (massive VRAM reduction) ---
+    # The sublinear attention loops over query chunks; smaller chunk => lower peak
+    # activation memory, mathematically identical output. Lets small GPUs run long
+    # context (1300+) without OOM. User-supplied env always wins.
+    if not env.get("AGILLM_SUBLINEAR_CHUNK"):
+        try:
+            _prof = characterize_machine()
+            _vram = float(_prof.get("gpu_vram_gb") or 0)
+            _dev = _prof.get("best_device", "cpu")
+        except Exception:
+            _vram, _dev = 0.0, "cpu"
+        if _dev in ("cuda", "directml") and _vram > 0:
+            if _vram >= 70:
+                _chunk = 128
+            elif _vram >= 40:
+                _chunk = 96
+            elif _vram >= 24:
+                _chunk = 48
+            elif _vram >= 16:
+                _chunk = 32
+            elif _vram >= 8:
+                _chunk = 16
+            else:
+                _chunk = 8
+            env["AGILLM_SUBLINEAR_CHUNK"] = str(_chunk)
+            env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+            print(json.dumps({"event": "vram_adaptive", "gpu_vram_gb": _vram,
+                              "sublinear_chunk": _chunk}), flush=True)
+
     if args.worker_cmd:
         template_data = {
             "package": str(package),

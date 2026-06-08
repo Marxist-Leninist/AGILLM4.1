@@ -37,6 +37,40 @@ def _ledger():
     return _Ledger() if _Ledger is not None else None
 
 
+INFER_BACKEND = os.environ.get("AGILLM41_INFER_BACKEND", "http://127.0.0.1:9200/generate")
+INFER_COST_PER_TOKEN = float(os.environ.get("AGILLM41_INFER_COST_PER_TOKEN", "0.2"))
+INFER_MAX_NEW = int(os.environ.get("AGILLM41_INFER_MAX_NEW", "128"))
+
+
+def _call_infer(prompt: str, max_new: int, body: dict) -> dict:
+    from urllib.request import Request as _Req, urlopen as _open
+    payload = {"prompt": prompt, "max_new": max_new}
+    for k in ("temperature", "greedy", "top_k", "top_p"):
+        if k in body:
+            payload[k] = body[k]
+    req = _Req(INFER_BACKEND, data=json.dumps(payload).encode("utf-8"),
+               headers={"Content-Type": "application/json"}, method="POST")
+    with _open(req, timeout=180) as r:
+        return json.loads(r.read() or b"{}")
+
+
+INFER_BACKEND = os.environ.get("AGILLM41_INFER_BACKEND", "http://127.0.0.1:9200/generate")
+INFER_COST_PER_TOKEN = float(os.environ.get("AGILLM41_INFER_COST_PER_TOKEN", "0.2"))
+INFER_MAX_NEW = int(os.environ.get("AGILLM41_INFER_MAX_NEW", "128"))
+
+
+def _call_infer(prompt: str, max_new: int, body: dict) -> dict:
+    from urllib.request import Request as _Req, urlopen as _open
+    payload = {"prompt": prompt, "max_new": max_new}
+    for k in ("temperature", "greedy", "top_k", "top_p"):
+        if k in body:
+            payload[k] = body[k]
+    req = _Req(INFER_BACKEND, data=json.dumps(payload).encode("utf-8"),
+               headers={"Content-Type": "application/json"}, method="POST")
+    with _open(req, timeout=180) as r:
+        return json.loads(r.read() or b"{}")
+
+
 def _network_stats(store) -> dict:
     sp = store.spool
     led = _ledger()
@@ -193,10 +227,22 @@ class LeaseStore:
 
     def request(self, node_id: str, capabilities: dict[str, Any]) -> dict[str, Any] | None:
         with self.lock:
+            # one active lease per node (no hoarding)
+            for lf in (self.spool / "leased").glob("*.json"):
+                ll = read_json(lf, {})
+                if ll.get("node_id") == node_id and utc() <= int(ll.get("expires_at", 0) or 0):
+                    return None
             candidates = sorted((self.spool / "available").glob("*.json"))
             if not candidates:
                 return None
+            # device-aware: GPU workers -> gpu-tier lease, CPU -> cpu-tier
+            _dev = (capabilities.get("device") or (capabilities.get("machine") or {}).get("best_device") or "cpu")
+            _want = "gpu" if str(_dev) in ("cuda", "directml") else "cpu"
             src = candidates[0]
+            for _c in candidates:
+                if ((read_json(_c, {}).get("metadata") or {}).get("tier")) == _want:
+                    src = _c
+                    break
             lease = read_json(src, {})
             lease_id = secrets.token_urlsafe(18)
             expires_at = utc() + int(lease.get("ttl_sec", 900))
@@ -220,12 +266,18 @@ class LeaseStore:
     _PKG_ROOT = "/root/agillm41_worker/packages"
     # Cloudflare-fronted, cached download origin for package/frozen GETs. Packages are
     # sliced (<=3 layers ~393MB) + fp16 frozen (~331MB) so they fit under CF Free's
-    # 512MB cache limit. API + large result-upload stay on join. (unproxied) since
+    # 512MB cache limit. The API + large result-upload stay on join. (unproxied) since
     # submits exceed CF's 100MB upload body limit. Override with AGILLM_DL_BASE.
     import os as _os
     _DL_BASE = (_os.environ.get("AGILLM_DL_BASE", "https://dl.opentransformers.online")).rstrip("/")
+    # Size-unlimited free CDN fallback: a public Hugging Face dataset mirror of the
+    # same /pkg/ tree. Used only if the CF/dl. primary fails (sha256 verified either
+    # way). Empty AGILLM_HF_MIRROR_BASE disables it. Updated each round by the mirror job.
+    _MIRROR_BASE = (_os.environ.get("AGILLM_HF_MIRROR_BASE",
+        "https://huggingface.co/datasets/OpenTransformer/agillm41-lease-packages/resolve/main")).rstrip("/")
 
     def _pkg_static_url(self, fp: str):
+        """Return a fast CF-cached /pkg/ download URL if fp is under the packages root."""
         try:
             import os
             if not fp:
@@ -238,6 +290,19 @@ class LeaseStore:
         except Exception:
             return None
 
+    def _pkg_mirror_url(self, fp: str):
+        """Return the HF dataset mirror URL for the same /pkg/ relpath, or None."""
+        try:
+            import os
+            if not fp or not self._MIRROR_BASE:
+                return None
+            rp = os.path.relpath(fp, self._PKG_ROOT)
+            if rp.startswith("..") or os.path.isabs(rp):
+                return None
+            return self._MIRROR_BASE + "/pkg/" + rp
+        except Exception:
+            return None
+
     def public_lease(self, lease: dict[str, Any], token: str) -> dict[str, Any]:
         lease_id = lease["lease_id"]
         out = {
@@ -247,6 +312,7 @@ class LeaseStore:
             "expires_at": lease["expires_at"],
             "package": {
                 "url": (self._pkg_static_url(lease["package"].get("path", "")) or f"{self.public_base_url}/api/v1/leases/{lease_id}/package"),
+                "mirror_url": self._pkg_mirror_url(lease["package"].get("path", "")),
                 "sha256": lease["package"]["sha256"],
                 "bytes": lease["package"]["bytes"],
                 "name": lease["package"]["name"],
@@ -263,6 +329,7 @@ class LeaseStore:
         if "frozen" in lease:
             out["frozen"] = {
                 "url": (self._pkg_static_url(lease["frozen"].get("path", "")) or f"{self.public_base_url}/api/v1/leases/{lease_id}/frozen"),
+                "mirror_url": self._pkg_mirror_url(lease["frozen"].get("path", "")),
                 "sha256": lease["frozen"]["sha256"],
                 "bytes": lease["frozen"]["bytes"],
                 "name": lease["frozen"]["name"],
@@ -371,6 +438,64 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/v1/infer":
+            try:
+                body = self.read_json_body()
+            except Exception as exc:
+                self.send_json(400, {"error": str(exc)[:120]}); return
+            pid = (body.get("participant_id") or "").strip()
+            prompt = body.get("prompt") or ""
+            if not pid or not prompt:
+                self.send_json(400, {"error": "participant_id and prompt required"}); return
+            led = _ledger()
+            if led is None:
+                self.send_json(503, {"error": "ledger unavailable"}); return
+            max_new = max(1, min(int(body.get("max_new", 32)), INFER_MAX_NEW))
+            quote = round(INFER_COST_PER_TOKEN * max_new, 3)
+            acct = led.account(pid)
+            if acct.get("points", 0) < quote:
+                self.send_json(402, {"error": "insufficient points", "balance": round(acct.get("points", 0), 3),
+                                     "quote": quote, "cost_per_token": INFER_COST_PER_TOKEN,
+                                     "earn_by": "run the join worker to contribute training"}); return
+            try:
+                result = _call_infer(prompt, max_new, body)
+            except Exception as exc:
+                self.send_json(502, {"error": f"inference backend unavailable: {exc}"[:160]}); return
+            actual = int(result.get("tokens", max_new))
+            charge = round(INFER_COST_PER_TOKEN * actual, 3)
+            a = led.debit(pid, charge) or led.account(pid)
+            self.send_json(200, {"completion": result.get("completion", ""), "tokens": actual,
+                                 "charged": charge, "balance": round(a.get("points", 0), 3),
+                                 "tok_per_sec": result.get("tok_per_sec")}); return
+        if parsed.path == "/api/v1/infer":
+            try:
+                body = self.read_json_body()
+            except Exception as exc:
+                self.send_json(400, {"error": str(exc)[:120]}); return
+            pid = (body.get("participant_id") or "").strip()
+            prompt = body.get("prompt") or ""
+            if not pid or not prompt:
+                self.send_json(400, {"error": "participant_id and prompt required"}); return
+            led = _ledger()
+            if led is None:
+                self.send_json(503, {"error": "ledger unavailable"}); return
+            max_new = max(1, min(int(body.get("max_new", 32)), INFER_MAX_NEW))
+            quote = round(INFER_COST_PER_TOKEN * max_new, 3)
+            acct = led.account(pid)
+            if acct.get("points", 0) < quote:
+                self.send_json(402, {"error": "insufficient points", "balance": round(acct.get("points", 0), 3),
+                                     "quote": quote, "cost_per_token": INFER_COST_PER_TOKEN,
+                                     "earn_by": "run the join worker to contribute training"}); return
+            try:
+                result = _call_infer(prompt, max_new, body)
+            except Exception as exc:
+                self.send_json(502, {"error": f"inference backend unavailable: {exc}"[:160]}); return
+            actual = int(result.get("tokens", max_new))
+            charge = round(INFER_COST_PER_TOKEN * actual, 3)
+            a = led.debit(pid, charge) or led.account(pid)
+            self.send_json(200, {"completion": result.get("completion", ""), "tokens": actual,
+                                 "charged": charge, "balance": round(a.get("points", 0), 3),
+                                 "tok_per_sec": result.get("tok_per_sec")}); return
         if parsed.path == "/api/v1/leases/request":
             try:
                 body = self.read_json_body()

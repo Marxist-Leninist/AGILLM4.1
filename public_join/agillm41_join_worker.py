@@ -11,7 +11,6 @@ import hashlib
 import http.client
 import json
 import os
-import platform
 from pathlib import Path
 import socket
 import ssl
@@ -57,7 +56,8 @@ def http_json(url: str, payload: dict[str, Any], insecure: bool) -> tuple[int, d
 
 def download(url: str, dest: Path, expected_sha: str, token: str, insecure: bool) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    req = Request(url, headers={"Authorization": f"Bearer {token}"})
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    req = Request(url, headers=headers)
     tmp = dest.with_suffix(dest.suffix + ".part")
     h = hashlib.sha256()
     with urlopen(req, context=ssl_context(insecure), timeout=300) as r, tmp.open("wb") as f:
@@ -107,8 +107,20 @@ def cache_artifact(lease: dict[str, Any], key: str, cache_dir: Path, token: str,
     dest = cache_dir / f"{spec['sha256'][:16]}_{spec['name']}"
     if dest.exists() and sha256_file(dest).lower() == spec["sha256"].lower():
         return dest
-    download(spec["url"], dest, spec["sha256"], token, insecure)
-    return dest
+    # Primary = Cloudflare-fronted dl. subdomain (lease token); fall back to the
+    # public Hugging Face mirror (no token) so a CF/origin hiccup can't strand a
+    # volunteer. sha256 is verified either way, so a bad mirror just retries.
+    attempts = [(spec["url"], token)]
+    if spec.get("mirror_url"):
+        attempts.append((spec["mirror_url"], ""))
+    last_err = None
+    for _u, _tok in attempts:
+        try:
+            download(_u, dest, spec["sha256"], _tok, insecure)
+            return dest
+        except Exception as exc:  # noqa: BLE001 - try next mirror
+            last_err = exc
+    raise last_err if last_err else RuntimeError("no download url for " + key)
 
 
 def default_worker_cmd(args: argparse.Namespace, lease: dict[str, Any], package: Path, frozen: Path | None, out: Path) -> list[str]:
@@ -157,36 +169,6 @@ def run_worker(args: argparse.Namespace, lease: dict[str, Any], package: Path, f
     env["MKL_NUM_THREADS"] = threads
     env["OPENBLAS_NUM_THREADS"] = threads
     env.setdefault("TOKENIZER_ID", "deepseek-ai/DeepSeek-V4-Pro")
-
-    # --- VRAM-adaptive diffusion-block attention chunk (massive VRAM reduction) ---
-    # The sublinear attention loops over query chunks; smaller chunk => lower peak
-    # activation memory, mathematically identical output. Lets small GPUs run long
-    # context (1300+) without OOM. User-supplied env always wins.
-    if not env.get("AGILLM_SUBLINEAR_CHUNK"):
-        try:
-            _prof = characterize_machine()
-            _vram = float(_prof.get("gpu_vram_gb") or 0)
-            _dev = _prof.get("best_device", "cpu")
-        except Exception:
-            _vram, _dev = 0.0, "cpu"
-        if _dev in ("cuda", "directml") and _vram > 0:
-            if _vram >= 70:
-                _chunk = 128
-            elif _vram >= 40:
-                _chunk = 96
-            elif _vram >= 24:
-                _chunk = 48
-            elif _vram >= 16:
-                _chunk = 32
-            elif _vram >= 8:
-                _chunk = 16
-            else:
-                _chunk = 8
-            env["AGILLM_SUBLINEAR_CHUNK"] = str(_chunk)
-            env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-            print(json.dumps({"event": "vram_adaptive", "gpu_vram_gb": _vram,
-                              "sublinear_chunk": _chunk}), flush=True)
-
     if args.worker_cmd:
         template_data = {
             "package": str(package),
@@ -201,17 +183,6 @@ def run_worker(args: argparse.Namespace, lease: dict[str, Any], package: Path, f
         subprocess.check_call(default_worker_cmd(args, lease, package, frozen, out), env=env)
     if not out.exists() or out.stat().st_size <= 0:
         raise RuntimeError(f"worker did not create {out}")
-
-
-def get_balance(coordinator_url: str, participant_id: str, insecure: bool) -> dict[str, Any] | None:
-    if not participant_id:
-        return None
-    url = urljoin(coordinator_url.rstrip("/") + "/", f"api/v1/points/{participant_id}")
-    try:
-        with urlopen(Request(url), context=ssl_context(insecure), timeout=30) as r:
-            return json.loads(r.read() or b"{}")
-    except Exception:
-        return None
 
 
 def once(args: argparse.Namespace) -> bool:
@@ -233,8 +204,6 @@ def once(args: argparse.Namespace) -> bool:
                 "threads": args.threads,
                 "vchunk": args.vchunk,
                 "max_result_bytes": args.max_result_bytes,
-                "participant_id": getattr(args, "participant_id", ""),
-                "machine": getattr(args, "machine", {}),
             },
         },
         args.insecure,
@@ -266,70 +235,7 @@ def once(args: argparse.Namespace) -> bool:
         ),
         flush=True,
     )
-    bal = get_balance(args.coordinator_url, getattr(args, "participant_id", ""), args.insecure)
-    if bal is not None:
-        print(json.dumps({"event": "points", "participant_id": bal.get("participant_id"),
-                          "points": bal.get("points"), "accepted": bal.get("accepted"),
-                          "note": "credited after server-side validation"}), flush=True)
     return True
-
-
-def characterize_machine() -> dict[str, Any]:
-    """Best-effort hardware profile + best available training backend.
-
-    No hard dependency on torch: if torch is missing we fall back to cpu and
-    record the import error so the coordinator can see why.
-    """
-    prof: dict[str, Any] = {
-        "platform": platform.platform(),
-        "python": platform.python_version(),
-        "cpu_count": os.cpu_count() or 1,
-    }
-    try:
-        if hasattr(os, "sysconf") and "SC_PHYS_PAGES" in os.sysconf_names:
-            prof["ram_gb"] = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1)
-    except Exception:
-        pass
-    best = "cpu"
-    try:
-        import torch
-        prof["torch"] = torch.__version__
-        if torch.cuda.is_available():
-            best = "cuda"
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            prof["gpu"] = props.name
-            prof["gpu_vram_gb"] = round(props.total_memory / 1e9, 1)
-            prof["gpu_count"] = torch.cuda.device_count()
-            prof["cuda"] = torch.version.cuda
-        else:
-            try:
-                import torch_directml
-                if torch_directml.is_available():
-                    best = "directml"
-                    try:
-                        prof["gpu"] = torch_directml.device_name(0)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    except Exception as exc:
-        prof["torch_error"] = str(exc)[:200]
-    if "gpu" not in prof:
-        # fallback: CUDA may not be ready in torch at boot; ask nvidia-smi directly
-        try:
-            import subprocess
-            out = subprocess.run(["nvidia-smi","--query-gpu=name,memory.total","--format=csv,noheader,nounits"],
-                                 capture_output=True, text=True, timeout=8).stdout.strip().splitlines()
-            if out:
-                name, mem = (out[0].split(",")+["",""])[:2]
-                prof["gpu"] = name.strip()
-                try: prof["gpu_vram_gb"] = round(float(mem)/1024, 1)
-                except Exception: pass
-                if best == "cpu": best = "cuda"
-        except Exception:
-            pass
-    prof["best_device"] = best
-    return prof
 
 
 def main() -> int:
@@ -338,8 +244,7 @@ def main() -> int:
     ap.add_argument("--workdir", default=os.environ.get("AGILLM41_JOIN_WORKDIR") or "./agillm41_join_work")
     ap.add_argument("--node-id", default=os.environ.get("AGILLM41_NODE_ID") or os.environ.get("AGILLM35_NODE_ID", ""))
     ap.add_argument("--join-code", default=os.environ.get("AGILLM41_JOIN_CODE", ""))
-    ap.add_argument("--device", default="auto", help="auto|cpu|cuda|directml (auto detects the best backend)")
-    ap.add_argument("--participant-id", default=os.environ.get("AGILLM41_PARTICIPANT_ID", ""), help="stable id to accrue contribution points; auto-generated + persisted if unset")
+    ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--vchunk", type=int, default=4096)
@@ -354,30 +259,6 @@ def main() -> int:
     ap.add_argument("--sleep-sec", type=int, default=30)
     ap.add_argument("--insecure", action="store_true", help="allow invalid TLS certs; test only")
     args = ap.parse_args()
-    args.machine = characterize_machine()
-    if args.device == "auto":
-        args.device = args.machine["best_device"]
-        cores = args.machine["cpu_count"]
-        # GPU hosts can use all cores for dataloading; CPU hosts keep half free
-        args.threads = cores if args.device != "cpu" else max(1, cores // 2)
-    args.machine["device"] = args.device
-    args.machine["threads"] = args.threads
-    print(json.dumps({"event": "machine", **args.machine}), flush=True)
-    if not args.participant_id:
-        pid_file = Path(args.workdir) / "participant_id.txt"
-        try:
-            args.participant_id = pid_file.read_text().strip()
-        except Exception:
-            args.participant_id = ""
-        if not args.participant_id:
-            import secrets as _secrets
-            args.participant_id = "pid_" + _secrets.token_urlsafe(18)
-            try:
-                pid_file.parent.mkdir(parents=True, exist_ok=True)
-                pid_file.write_text(args.participant_id)
-            except Exception:
-                pass
-    print(json.dumps({"event": "participant", "participant_id": args.participant_id}), flush=True)
     if not args.coordinator_url:
         raise SystemExit("set --coordinator-url or AGILLM41_COORDINATOR_URL")
     while True:

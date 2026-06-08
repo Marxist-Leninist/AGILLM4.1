@@ -110,6 +110,11 @@ cycle_once() {
     copy_to_geth "$_gdir" "$_gbase"
     ssh -i "$GETH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no "$GETH_HOST" "cd '$GETH_WORKER_ROOT' && /root/agillm3_geth_cpu/venv/bin/python code/agillm4_publish_opportunistic_lease.py --export-dir '$GETH_WORKER_ROOT/packages/$_gbase' --root '$OPPORTUNISTIC_ROOT' --worker-id laptop-auto --source-worker laptop-auto"
     printf '{"event":"gpu_lease_published","worker":"gpu-tier","dblocks":"0,1,2,3","batch":%s,"block":%s}\n' "$_b" "$_blk"
+    # mirror the just-published GPU round to the free, size-unlimited HF CDN as a
+    # second download origin (additive; CF/dl. stays primary). Non-blocking.
+    if [ -f /workspace/agillm41_hf_mirror.py ]; then
+      HF_HUB_DISABLE_XET=1 nohup python3 /workspace/agillm41_hf_mirror.py --round-dir "$_gdir" --keep 2 >> /tmp/hf_mirror_auto.log 2>&1 &
+    fi
   else
     ssh -i "$GETH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no "$GETH_HOST" "cd '$GETH_WORKER_ROOT' && /root/agillm3_geth_cpu/venv/bin/python code/agillm4_publish_opportunistic_lease.py --export-dir '$GETH_WORKER_ROOT/packages/$base' --root '$OPPORTUNISTIC_ROOT' --worker-id laptop-auto --source-worker laptop-auto"
   fi

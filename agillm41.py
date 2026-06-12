@@ -546,6 +546,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         ar_val = float(ar.detach())
         _profile_toc(state, "ar_ce", _t)
         _t = _profile_tic(prof)
+        _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+        if torch.is_tensor(_aux):
+            ar = ar + _aux.to(ar.dtype)
         scaler.scale(ar).backward()
         _profile_toc(state, "ar_backward", _t)
         del causal, emb, zt, h, Dn, ar_hidden, ar_targets, ar_raw, ar, ar_used, ar_total
@@ -560,21 +563,28 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             for lpos, li in enumerate(layers):
                 h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args)
             Ds = core.ln(cs * zt2 + co * h2)
-            last = Ds[:, -SATB:]
         _profile_toc(state, "sat_forward", _t)
         _t = _profile_tic(prof)
+        # SAT decode uses the latest SAT_BLOCK hidden states to emit the next
+        # SAT_BLOCK tokens. Train that contract densely across the context.
+        sat_ctx = Ds[:, :-SATB]
+        sat_tgt = ids[:, SATB:]
+        if sat_ctx.size(1) == 0 or sat_ctx.size(1) != sat_tgt.size(1):
+            sat_ctx = Ds[:, :-1]
+            sat_tgt = ids[:, 1:]
         sat_hidden, sat_targets, sat_used, sat_total = _sample_token_loss_inputs(
-            last, ids[:, 1 : SATB + 1], int(getattr(args, "dblock_sat_loss_tokens", 0))
+            sat_ctx, sat_tgt, int(getattr(args, "dblock_sat_loss_tokens", 0))
         )
+        sat_gate_ctx = sat_ctx[:, ::SATB]
         with M.amp(args.amp):
             satf = fused_ce(sat_hidden, sat_h.proj.weight, sat_targets)
             satv = (
                 M.EMIT_LAMBDA
                 * F.cross_entropy(
-                    sat_h.gate(Ds[:, 0].float()),
-                    torch.ones(ids.size(0), dtype=torch.long, device=ids.device),
+                    sat_h.gate(sat_gate_ctx.reshape(-1, sat_gate_ctx.size(-1)).float()),
+                    torch.ones(sat_gate_ctx.numel() // sat_gate_ctx.size(-1), dtype=torch.long, device=ids.device),
                 )
-                if sat_h.gate is not None
+                if sat_h.gate is not None and sat_gate_ctx.size(1) > 0
                 else 0.0
             )
             sat_raw = satf + satv
@@ -583,9 +593,12 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         _profile_toc(state, "sat_ce", _t)
         sat_val = float(sat.detach())
         _t = _profile_tic(prof)
+        _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+        if torch.is_tensor(_aux):
+            sat = sat + _aux.to(sat.dtype)
         scaler.scale(sat).backward()
         _profile_toc(state, "sat_backward", _t)
-        del smask, emb2, zt2, h2, Ds, last, sat_hidden, sat_targets, satf, satv, sat_raw, sat
+        del smask, emb2, zt2, h2, Ds, sat_hidden, sat_targets, sat_gate_ctx, satf, satv, sat_raw, sat
 
     if run_nat:
         ratio = min(max(float(getattr(args, "nat_mask_ratio", 0.5)), 0.05), 0.95)
@@ -614,6 +627,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         nat_val = float(nat.detach())
         _profile_toc(state, "nat_ce", _t)
         _t = _profile_tic(prof)
+        _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+        if torch.is_tensor(_aux):
+            nat = nat + _aux.to(nat.dtype)
         scaler.scale(nat).backward()
         _profile_toc(state, "nat_backward", _t)
         del nat_ids, nat_in, m, hn, Dnat, nat_hidden, nat_targets, nat_raw, nat, nat_used, nat_total
@@ -631,6 +647,21 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         _profile_step_done(state, args)
         _update_stats(state, bi, total_val)
         return total_val
+
+    _spike_k = float(getattr(args, "loss_spike_skip", 0.0))
+    if _spike_k > 0.0:
+        _ema = state.get("spike_ema")
+        if _ema is not None and math.isfinite(_ema) and math.isfinite(raw_avg_val) and raw_avg_val > _spike_k * _ema:
+            opt.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"[dblock] loss spike raw_avg={raw_avg_val:.2f} > {_spike_k}x EMA={_ema:.2f}; skipped optimizer step", flush=True)
+            _profile_toc(state, "step_total", _step_t)
+            _profile_step_done(state, args)
+            _update_stats(state, bi, total_val)
+            return total_val
+        if math.isfinite(raw_avg_val):
+            state["spike_ema"] = raw_avg_val if _ema is None else (0.98 * _ema + 0.02 * raw_avg_val)
 
     _t = _profile_tic(prof)
     scaler.unscale_(opt)
@@ -1726,7 +1757,19 @@ def _auto_amp_dtype():
     return torch.float32
 
 def amp(enabled: bool):
-    return nullcontext() if not (enabled and DEV.type == "cuda") else _ac(device_type="cuda", dtype=_auto_amp_dtype())
+    if not enabled or DEV.type != "cuda":
+        return nullcontext()
+    dtype = _auto_amp_dtype()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        try:
+            return torch.amp.autocast("cuda", dtype=dtype)
+        except TypeError:
+            try:
+                return torch.amp.autocast(device_type="cuda", dtype=dtype)
+            except TypeError:
+                pass
+    return torch.cuda.amp.autocast(dtype=dtype)
+
 
 def _needs_grad_scaler() -> bool:
     return bool(DEV.type == "cuda" and _auto_amp_dtype() == torch.float16)
@@ -1819,15 +1862,490 @@ def _open_stream_one(ds_name: str, seed: int, streaming: bool = True):
 def token_stream(ds_names: str, target: int, seed: int = 42,
                  chat: bool = False, chat_messages_key: str = "messages",
                  sft_add_generation_prompt: bool = False, dataset_field_text: str = "text",
-                 streaming: bool = True):
-    ds_names = get_hot_datasets(ds_names)  # HOT LOAD
-    sources = [s.strip() for s in ds_names.split(",") if s.strip()]
-    if not sources: return
-    src_idx = 0; emitted = 0; it = None; attempts = 0; backoff_base = 2.0
-    while emitted < target:
+                 streaming: bool = True, use_hot_config: bool = True):
+    if use_hot_config:
+        ds_names = get_hot_datasets(ds_names)  # HOT LOAD
+    raw = [s.strip() for s in ds_names.split(",") if s.strip()]
+    if not raw: return
+    # Weighted interleave across sources, with an online single-layer reliability
+    # router on top. Base weights express policy; the router learns which sources
+    # are actually yielding clean text quickly in this run and across restarts.
+    sources, weights = [], []
+    for s in raw:
+        w = 1.0
+        head, sep, tail = s.rpartition("|")
+        if sep:
+            try:
+                w = float(tail); s = head
+            except ValueError:
+                pass
+        sources.append(s); weights.append(max(w, 0.0))
+    if sum(weights) <= 0:
+        weights = [1.0] * len(sources)
+    _rng = random.Random(seed)
+    its = [None] * len(sources)
+    emitted = 0
+    fail_counts = [0] * len(sources)
+    disabled_until = [0.0] * len(sources)
+    last_retry_log = [0.0] * len(sources)
+    backoff_base = 2.0
+    max_cooldown = float(os.environ.get("AGILLM_STREAM_SOURCE_MAX_COOLDOWN_SEC", "300") or 300)
+    fatal_cooldown = float(os.environ.get("AGILLM_STREAM_SOURCE_FATAL_COOLDOWN_SEC", "1800") or 1800)
+    fatal_errors = {"DataFilesNotFoundError", "ArrowInvalid", "CastError", "FileNotFoundError"}
+
+    router_enabled = str(os.environ.get("AGILLM_DATASET_NN_ROUTER", "1")).lower() not in {"0", "false", "off", "no"}
+    router_state_path = Path(os.environ.get("AGILLM_DATASET_ROUTER_STATE", "/workspace/agillm_dataset_router_state.json"))
+    router_explore = max(0.0, min(float(os.environ.get("AGILLM_DATASET_ROUTER_EXPLORE", "0.03") or 0.03), 0.50))
+    router_lr = max(0.0, min(float(os.environ.get("AGILLM_DATASET_ROUTER_LR", "0.03") or 0.03), 0.20))
+    router_min_score = max(0.01, min(float(os.environ.get("AGILLM_DATASET_ROUTER_MIN_SCORE", "0.05") or 0.05), 1.0))
+    router_sharpness = max(1.0, min(float(os.environ.get("AGILLM_DATASET_ROUTER_SHARPNESS", "3.0") or 3.0), 8.0))
+    router_log_sec = max(30.0, float(os.environ.get("AGILLM_DATASET_ROUTER_LOG_SEC", "300") or 300))
+    router_save_sec = max(10.0, float(os.environ.get("AGILLM_DATASET_ROUTER_SAVE_SEC", "60") or 60))
+    router_last_log = 0.0
+    router_last_save = 0.0
+
+    def _env_bool(name, default=False):
+        return str(os.environ.get(name, "1" if default else "0")).strip().lower() not in {"", "0", "false", "off", "no"}
+
+    def _env_float(name, default, lo=None, hi=None):
         try:
-            if it is None: it = _open_stream_one(sources[src_idx], seed, streaming=streaming)
-            ex = next(it)
+            val = float(os.environ.get(name, str(default)) or default)
+        except Exception:
+            val = float(default)
+        if lo is not None:
+            val = max(float(lo), val)
+        if hi is not None:
+            val = min(float(hi), val)
+        return val
+
+    agent_enabled = _env_bool("AGILLM_DATASET_AGENT_ROUTER", False)
+    agent_timeout = _env_float("AGILLM_DATASET_AGENT_TIMEOUT_SEC", 8.0, 1.0, 60.0)
+    agent_min_interval = _env_float("AGILLM_DATASET_AGENT_MIN_INTERVAL_SEC", 600.0, 30.0, 86400.0)
+    agent_source_interval = _env_float("AGILLM_DATASET_AGENT_SOURCE_INTERVAL_SEC", 900.0, 30.0, 86400.0)
+    agent_fail_threshold = int(_env_float("AGILLM_DATASET_AGENT_FAILS", 2.0, 1.0, 50.0))
+    agent_min_pulls = int(_env_float("AGILLM_DATASET_AGENT_MIN_PULLS", 4.0, 1.0, 1000.0))
+    agent_err_threshold = _env_float("AGILLM_DATASET_AGENT_ERR_EMA", 0.18, 0.01, 1.0)
+    agent_empty_threshold = _env_float("AGILLM_DATASET_AGENT_EMPTY_EMA", 0.20, 0.01, 1.0)
+    agent_latency_threshold = _env_float("AGILLM_DATASET_AGENT_LATENCY_SEC", 20.0, 1.0, 600.0)
+    agent_min_conf = _env_float("AGILLM_DATASET_AGENT_MIN_CONF", 0.25, 0.0, 1.0)
+    agent_default_penalty = _env_float("AGILLM_DATASET_AGENT_PENALTY", 0.35, 0.01, 1.0)
+    agent_default_cooldown = _env_float("AGILLM_DATASET_AGENT_COOLDOWN_SEC", 900.0, 30.0, 86400.0)
+    agent_disable_sec = _env_float("AGILLM_DATASET_AGENT_DISABLE_SEC", 21600.0, 60.0, 604800.0)
+    agent_last_call = 0.0
+
+    def _sigmoid(x):
+        if x < -40.0: return 0.0
+        if x > 40.0: return 1.0
+        return 1.0 / (1.0 + math.exp(-x))
+
+    def _load_router_state():
+        default = {
+            "schema": "agillm.dataset_router.v1",
+            "updated_utc": "",
+            "weights": [-0.25, 0.55, 2.20, -2.80, -0.85, 1.10, -1.70],
+            "sources": {},
+            "agent": {},
+        }
+        try:
+            if router_state_path.exists():
+                loaded = json.loads(router_state_path.read_text())
+                if isinstance(loaded, dict):
+                    default.update({k: loaded.get(k, default[k]) for k in default})
+                    if not isinstance(default.get("sources"), dict):
+                        default["sources"] = {}
+                    if not isinstance(default.get("weights"), list) or len(default["weights"]) != 7:
+                        default["weights"] = [-0.25, 0.55, 2.20, -2.80, -0.85, 1.10, -1.70]
+        except Exception as exc:
+            print(f"[dataset-router] warning: could not load {router_state_path}: {exc}", flush=True)
+        return default
+
+    router = _load_router_state()
+    router.setdefault("agent", {})
+    try:
+        agent_last_call = float(router["agent"].get("last_call", 0.0) or 0.0)
+    except Exception:
+        agent_last_call = 0.0
+
+    def _source_state(src):
+        st = router.setdefault("sources", {}).setdefault(src, {})
+        st.setdefault("ok_ema", 0.55)
+        st.setdefault("err_ema", 0.05)
+        st.setdefault("lat_ema", 1.0)
+        st.setdefault("tok_ema", 256.0)
+        st.setdefault("empty_ema", 0.05)
+        st.setdefault("pulls", 0)
+        st.setdefault("tokens", 0)
+        st.setdefault("errors", 0)
+        st.setdefault("empty", 0)
+        st.setdefault("last_ok", 0.0)
+        st.setdefault("last_error", "")
+        st.setdefault("last_score", 0.5)
+        st.setdefault("agent_score_mult", 1.0)
+        st.setdefault("agent_penalty_until", 0.0)
+        st.setdefault("agent_last_check", 0.0)
+        st.setdefault("agent_last_action", "")
+        st.setdefault("agent_last_reason", "")
+        st.setdefault("agent_last_error", "")
+        return st
+
+    for src in sources:
+        _source_state(src)
+
+    def _router_features(i, now):
+        total_w = max(sum(weights), 1e-9)
+        base = max(weights[i], 0.0) / total_w
+        st = _source_state(sources[i])
+        return [
+            1.0,
+            min(1.0, base * len(weights)),
+            float(st.get("ok_ema", 0.55)),
+            float(st.get("err_ema", 0.05)),
+            min(1.0, float(st.get("lat_ema", 1.0)) / 15.0),
+            min(1.0, float(st.get("tok_ema", 256.0)) / 4096.0),
+            float(st.get("empty_ema", 0.05)),
+        ]
+
+    def _router_score(i, now):
+        if not router_enabled:
+            return 1.0
+        ws = router.get("weights") or []
+        feats = _router_features(i, now)
+        z = sum(float(w) * float(f) for w, f in zip(ws, feats))
+        score = max(router_min_score, min(1.0, _sigmoid(z)))
+        st = _source_state(sources[i])
+        try:
+            until = float(st.get("agent_penalty_until", 0.0) or 0.0)
+            mult = max(0.01, min(2.0, float(st.get("agent_score_mult", 1.0) or 1.0)))
+        except Exception:
+            until, mult = 0.0, 1.0
+        if until > now:
+            score = max(router_min_score, min(1.0, score * mult))
+        elif until or mult != 1.0:
+            st["agent_score_mult"] = 1.0
+            st["agent_penalty_until"] = 0.0
+        st["last_score"] = score
+        return score
+
+    def _save_router_state(force=False):
+        nonlocal router_last_save
+        now = time.time()
+        if not force and now - router_last_save < router_save_sec:
+            return
+        router_last_save = now
+        try:
+            router["updated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+            tmp = router_state_path.with_suffix(router_state_path.suffix + ".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(router, indent=2, sort_keys=True) + "\n")
+            tmp.replace(router_state_path)
+        except Exception as exc:
+            print(f"[dataset-router] warning: could not save {router_state_path}: {exc}", flush=True)
+
+    def _agent_read_secret(env_names, paths):
+        for name in env_names:
+            val = os.environ.get(name, "")
+            if val.strip():
+                return val.strip()
+        for raw_path in paths:
+            try:
+                p = Path(raw_path).expanduser()
+                if p.exists():
+                    val = p.read_text(errors="ignore").strip()
+                    if val:
+                        return val
+            except Exception:
+                pass
+        return ""
+
+    def _agent_provider_key_model():
+        pref = str(os.environ.get("AGILLM_DATASET_AGENT_PROVIDER", "auto") or "auto").strip().lower()
+        deepseek_key = _agent_read_secret(
+            ("DEEPSEEK_API_KEY", "AGILLM_DEEPSEEK_API_KEY"),
+            (
+                "/root/.config/agillm/deepseek_api_key",
+                "/workspace/private/deepseek_api_key",
+                "/workspace/agillm_private/deepseek_api_key",
+            ),
+        )
+        openrouter_key = _agent_read_secret(
+            ("OPENROUTER_API_KEY", "AGILLM_OPENROUTER_API_KEY"),
+            (
+                "/root/.config/agillm/openrouter_api_key",
+                "/workspace/private/openrouter_api_key",
+                "/workspace/agillm_private/openrouter_api_key",
+            ),
+        )
+        deepseek_model = os.environ.get("AGILLM_DATASET_AGENT_DEEPSEEK_MODEL", "deepseek-chat")
+        openrouter_model = os.environ.get("AGILLM_DATASET_AGENT_OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324")
+        if pref == "deepseek":
+            return "deepseek", deepseek_key, deepseek_model, "configured" if deepseek_key else "missing-key"
+        if pref == "openrouter":
+            return "openrouter", openrouter_key, openrouter_model, "configured" if openrouter_key else "missing-key"
+        if deepseek_key:
+            return "deepseek", deepseek_key, deepseek_model, "configured"
+        if openrouter_key:
+            return "openrouter", openrouter_key, openrouter_model, "configured"
+        return "auto", "", "", "missing-key"
+
+    def _agent_extract_json(text):
+        text = str(text or "").strip()
+        if not text:
+            return {}
+        try:
+            obj = json.loads(text)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                obj = json.loads(text[start:end + 1])
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _agent_call(provider, key, model, payload):
+        import urllib.error
+        import urllib.request
+        if provider == "deepseek":
+            url = "https://api.deepseek.com/chat/completions"
+            headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+        elif provider == "openrouter":
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": "Bearer " + key,
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://join.opentransformers.online",
+                "X-Title": "AGILLM dataset router",
+            }
+        else:
+            return False, "unknown_provider"
+        system = (
+            "You are a dataset routing policy agent for an active neural-network training run. "
+            "Return compact JSON only. You may advise rerouting, cooldown, penalizing, disabling, keeping, or recovering a dataset source. "
+            "Never create, rewrite, summarize, or transform training samples. "
+            "Allowed actions: keep, penalize, cooldown, disable, recover. "
+            "Use score_multiplier between 0.01 and 2.0 and cooldown_sec as seconds."
+        )
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, sort_keys=True)},
+            ],
+            "temperature": 0,
+            "max_tokens": 180,
+        }
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=agent_timeout) as resp:
+                raw = resp.read(32768).decode("utf-8", errors="replace")
+            parsed = json.loads(raw)
+            content = (((parsed.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            if not content and isinstance(parsed.get("output"), str):
+                content = parsed["output"]
+            return True, content
+        except urllib.error.HTTPError as exc:
+            return False, f"HTTP{getattr(exc, 'code', 'error')}"
+        except Exception as exc:
+            return False, type(exc).__name__
+
+    def _agent_maybe_advise(i, event):
+        nonlocal agent_last_call
+        if not agent_enabled or i is None:
+            return
+        now = time.time()
+        st = _source_state(sources[i])
+        pulls = int(st.get("pulls", 0))
+        errors = int(st.get("errors", 0))
+        if pulls < agent_min_pulls and errors < agent_fail_threshold:
+            return
+        bad_enough = (
+            fail_counts[i] >= agent_fail_threshold
+            or errors >= agent_fail_threshold
+            or float(st.get("err_ema", 0.0)) >= agent_err_threshold
+            or float(st.get("empty_ema", 0.0)) >= agent_empty_threshold
+            or float(st.get("lat_ema", 0.0)) >= agent_latency_threshold
+        )
+        if not bad_enough:
+            return
+        if now - agent_last_call < agent_min_interval:
+            return
+        if now - float(st.get("agent_last_check", 0.0) or 0.0) < agent_source_interval:
+            return
+        provider, key, model, status = _agent_provider_key_model()
+        if not key:
+            router.setdefault("agent", {})["last_status"] = status
+            st["agent_last_check"] = now
+            st["agent_last_error"] = status
+            _save_router_state(force=True)
+            return
+        st["agent_last_check"] = now
+        router.setdefault("agent", {})["last_call"] = now
+        router["agent"]["last_provider"] = provider
+        router["agent"]["last_model"] = model
+        agent_last_call = now
+        payload = {
+            "source_index": i,
+            "source": sources[i],
+            "event": str(event or "failure")[:120],
+            "policy": "reroute/cooldown only; never generate or modify data",
+            "stats": {
+                "pulls": pulls,
+                "errors": errors,
+                "empty": int(st.get("empty", 0)),
+                "fail_count": int(fail_counts[i]),
+                "ok_ema": float(st.get("ok_ema", 0.0)),
+                "err_ema": float(st.get("err_ema", 0.0)),
+                "empty_ema": float(st.get("empty_ema", 0.0)),
+                "lat_ema": float(st.get("lat_ema", 0.0)),
+                "tok_ema": float(st.get("tok_ema", 0.0)),
+                "router_score": float(st.get("last_score", 0.5)),
+                "disabled_for_sec": max(0.0, float(disabled_until[i]) - now),
+                "agent_score_mult": float(st.get("agent_score_mult", 1.0) or 1.0),
+            },
+            "return_schema": {
+                "action": "keep|penalize|cooldown|disable|recover",
+                "score_multiplier": 0.35,
+                "cooldown_sec": 900,
+                "confidence": 0.5,
+                "reason": "short reason",
+            },
+        }
+        ok, content = _agent_call(provider, key, model, payload)
+        if not ok:
+            st["agent_last_error"] = str(content)[:120]
+            print(f"[dataset-agent] provider={provider} model={model} src={i}:{sources[i][:42]} error={content}", flush=True)
+            _save_router_state(force=True)
+            return
+        advice = _agent_extract_json(content)
+        action = str(advice.get("action", "keep") or "keep").strip().lower()
+        if action not in {"keep", "penalize", "cooldown", "disable", "recover"}:
+            action = "keep"
+        try:
+            confidence = max(0.0, min(1.0, float(advice.get("confidence", 0.0) or 0.0)))
+        except Exception:
+            confidence = 0.0
+        if confidence < agent_min_conf:
+            action = "keep"
+        try:
+            mult = max(0.01, min(2.0, float(advice.get("score_multiplier", agent_default_penalty) or agent_default_penalty)))
+        except Exception:
+            mult = agent_default_penalty
+        try:
+            cooldown_sec = max(0.0, float(advice.get("cooldown_sec", agent_default_cooldown) or agent_default_cooldown))
+        except Exception:
+            cooldown_sec = agent_default_cooldown
+        reason = str(advice.get("reason", "") or "")[:180]
+        if action == "recover":
+            st["agent_score_mult"] = 1.0
+            st["agent_penalty_until"] = 0.0
+            disabled_until[i] = 0.0
+        elif action == "penalize":
+            st["agent_score_mult"] = min(float(st.get("agent_score_mult", 1.0) or 1.0), mult)
+            st["agent_penalty_until"] = max(float(st.get("agent_penalty_until", 0.0) or 0.0), now + max(cooldown_sec, agent_default_cooldown))
+        elif action == "cooldown":
+            st["agent_score_mult"] = min(float(st.get("agent_score_mult", 1.0) or 1.0), mult)
+            until = now + max(cooldown_sec, agent_default_cooldown)
+            st["agent_penalty_until"] = max(float(st.get("agent_penalty_until", 0.0) or 0.0), until)
+            disabled_until[i] = max(disabled_until[i], until)
+        elif action == "disable":
+            st["agent_score_mult"] = min(float(st.get("agent_score_mult", 1.0) or 1.0), min(mult, agent_default_penalty))
+            until = now + max(cooldown_sec, agent_disable_sec)
+            st["agent_penalty_until"] = max(float(st.get("agent_penalty_until", 0.0) or 0.0), until)
+            disabled_until[i] = max(disabled_until[i], until)
+        st["agent_last_action"] = action
+        st["agent_last_reason"] = reason
+        st["agent_last_error"] = ""
+        router.setdefault("agent", {})["last_status"] = "ok"
+        _save_router_state(force=True)
+        print(
+            f"[dataset-agent] provider={provider} model={model} src={i}:{sources[i][:42]} "
+            f"event={str(event)[:40]} action={action} mult={mult:.2f} cooldown={cooldown_sec:.0f}s conf={confidence:.2f} reason={reason}",
+            flush=True,
+        )
+
+    def _router_update(i, label, feat, token_count=0, latency=0.0, err="", empty=False):
+        if i is None:
+            return
+        st = _source_state(sources[i])
+        label = 1.0 if label else 0.0
+        alpha = 0.04
+        st["pulls"] = int(st.get("pulls", 0)) + 1
+        st["ok_ema"] = (1.0 - alpha) * float(st.get("ok_ema", 0.55)) + alpha * label
+        st["err_ema"] = (1.0 - alpha) * float(st.get("err_ema", 0.05)) + alpha * (1.0 - label)
+        st["lat_ema"] = (1.0 - alpha) * float(st.get("lat_ema", 1.0)) + alpha * max(float(latency or 0.0), 0.0)
+        st["tok_ema"] = (1.0 - alpha) * float(st.get("tok_ema", 256.0)) + alpha * max(float(token_count or 0.0), 0.0)
+        st["empty_ema"] = (1.0 - alpha) * float(st.get("empty_ema", 0.05)) + alpha * (1.0 if empty else 0.0)
+        if label >= 0.5:
+            st["tokens"] = int(st.get("tokens", 0)) + int(token_count or 0)
+            st["last_ok"] = time.time()
+            st["last_error"] = ""
+        else:
+            st["errors"] = int(st.get("errors", 0)) + 1
+            st["last_error"] = str(err or "bad_sample")[:120]
+            if empty:
+                st["empty"] = int(st.get("empty", 0)) + 1
+        if router_enabled and feat and router_lr > 0:
+            pred = _sigmoid(sum(float(w) * float(f) for w, f in zip(router["weights"], feat)))
+            grad = label - pred
+            router["weights"] = [max(-8.0, min(8.0, float(w) + router_lr * grad * float(f))) for w, f in zip(router["weights"], feat)]
+        _save_router_state(force=(label < 0.5 or int(st.get("pulls", 0)) <= 3 or (int(st.get("pulls", 0)) % 25 == 0)))
+
+    def _choose_source(available, now):
+        if not router_enabled or _rng.random() < router_explore:
+            return _rng.choices(available, weights=[weights[i] for i in available])[0]
+        eff = []
+        for i in available:
+            score = _router_score(i, now)
+            eff.append(max(1e-9, weights[i] * (score ** router_sharpness)))
+        if sum(eff) <= 0:
+            eff = [weights[i] for i in available]
+        return _rng.choices(available, weights=eff)[0]
+
+    agent_provider, agent_key, agent_model, agent_status = _agent_provider_key_model()
+    if not agent_enabled:
+        agent_desc = "off"
+    elif agent_key:
+        agent_desc = f"{agent_provider}:{agent_model}"
+    else:
+        agent_desc = f"{agent_provider}:missing-key"
+    print(
+        f"[dataset-router] nn={'on' if router_enabled else 'off'} explore={router_explore:.3f} "
+        f"agent={agent_desc} state={router_state_path} sources={len(sources)}",
+        flush=True,
+    )
+
+    while emitted < target:
+        now = time.time()
+        available = [i for i, w in enumerate(weights) if w > 0.0 and disabled_until[i] <= now]
+        if not available:
+            next_ready = min(disabled_until) if disabled_until else now + 1.0
+            sleep_s = max(1.0, min(30.0, next_ready - now))
+            print(f"[stream-retry] all sources cooling down, sleeping {sleep_s:.1f}s", flush=True)
+            time.sleep(sleep_s)
+            continue
+        if router_enabled and now - router_last_log >= router_log_sec:
+            rows = []
+            for i in range(len(sources)):
+                st = _source_state(sources[i])
+                rows.append((float(st.get("last_score", _router_score(i, now))), i, st))
+            rows.sort(reverse=True)
+            msg = "; ".join(
+                f"{i}:{sources[i][:36]} score={score:.2f} ok={st.get('ok_ema', 0):.2f} err={st.get('err_ema', 0):.2f} tok={st.get('tok_ema', 0):.0f}"
+                for score, i, st in rows[:5]
+            )
+            print(f"[dataset-router] {msg}", flush=True)
+            router_last_log = now
+        src_idx = _choose_source(available, now)
+        feat = _router_features(src_idx, now)
+        t0 = time.perf_counter()
+        try:
+            if its[src_idx] is None:
+                its[src_idx] = _open_stream_one(sources[src_idx], seed + src_idx, streaming=streaming)
+            ex = next(its[src_idx])
             text = None
             if isinstance(ex, dict):
                 if chat:
@@ -1837,25 +2355,47 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                         text = ex[dataset_field_text]
                     elif isinstance(ex.get("text"), str):
                         text = ex["text"]
-            if not isinstance(text, str):
-                attempts = 0; continue
+            if not isinstance(text, str) or not text.strip():
+                _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err="empty_or_missing_text", empty=True)
+                _agent_maybe_advise(src_idx, "empty_or_missing_text")
+                continue
+            if fail_counts[src_idx]:
+                print(f"[stream-recover] {sources[src_idx]} recovered after {fail_counts[src_idx]} failures", flush=True)
+                fail_counts[src_idx] = 0
+                disabled_until[src_idx] = 0.0
             enc = tok.encode(text)
             if EOS is not None and (len(enc) == 0 or enc[-1] != EOS):
                 enc = enc + [EOS]
+            if not enc:
+                _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err="empty_tokens", empty=True)
+                _agent_maybe_advise(src_idx, "empty_tokens")
+                continue
+            _router_update(src_idx, 1, feat, token_count=len(enc), latency=time.perf_counter() - t0)
             for t in enc:
                 yield t
                 emitted += 1
-                if emitted >= target: return
-            attempts = 0
+                if emitted >= target:
+                    _save_router_state(force=True)
+                    return
         except StopIteration:
-            it = None; src_idx = (src_idx + 1) % len(sources)
+            its[src_idx] = None  # exhausted: reopen on next pick (stream cycles)
         except Exception as e:
-            attempts += 1
-            sleep_s = min(60.0, backoff_base ** min(attempts, 6))
-            print(f"[stream-retry] {sources[src_idx]} error: {type(e).__name__}, sleeping {sleep_s:.1f}s")
-            time.sleep(sleep_s); it = None
-            if attempts % 5 == 0 and len(sources) > 1:
-                src_idx = (src_idx + 1) % len(sources)
+            its[src_idx] = None
+            fail_counts[src_idx] += 1
+            err = type(e).__name__
+            _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err=err)
+            cooldown = min(max_cooldown, backoff_base ** min(fail_counts[src_idx], 8))
+            if err in fatal_errors:
+                cooldown = max(cooldown, fatal_cooldown)
+            disabled_until[src_idx] = time.time() + cooldown
+            _agent_maybe_advise(src_idx, err)
+            if time.time() - last_retry_log[src_idx] > 15.0 or fail_counts[src_idx] <= 2:
+                print(
+                    f"[stream-retry] {sources[src_idx]} error: {err}, "
+                    f"cooling {cooldown:.1f}s failures={fail_counts[src_idx]}",
+                    flush=True,
+                )
+                last_retry_log[src_idx] = time.time()
 
 # ───────────────────────── ALiBi ─────────────────────────
 def _alibi_slopes(n_heads: int):
@@ -2238,6 +2778,8 @@ class TuneableAttentionMHA(nn.Module):
         if self.attn_backend != "sublinear" and self.use_relpos and rel_bias_tokens is not None:
             rel = alibi_bias(self.h, rel_bias_tokens)[:, :, -q.size(2):, :].to(device=q.device, dtype=q.dtype)
             attn_mask = rel if attn_mask is None else attn_mask + rel
+        if self.attn_backend == "sdpa" and attn_mask is not None and attn_mask.dtype != torch.bool and attn_mask.dtype != q.dtype:
+            attn_mask = attn_mask.to(dtype=q.dtype)
         if self.attn_backend == "sdpa":
             try:
                 z = F.scaled_dot_product_attention(
@@ -2257,7 +2799,7 @@ class TuneableAttentionMHA(nn.Module):
             att = (q @ k.transpose(-1, -2)) / math.sqrt(self.dk)
             if attn_mask is not None:
                 att = att + attn_mask
-            z = att.softmax(-1) @ v
+            z = att.softmax(-1).to(v.dtype) @ v
         z = z.transpose(1, 2).reshape(x.size(0), x.size(1), -1)
         out = self.drop(self.proj(z))
         if not use_cache:
@@ -2267,7 +2809,8 @@ class TuneableAttentionMHA(nn.Module):
 
 
 class MoEFFN(nn.Module):
-    def __init__(self, d: int, mlp_mult: int = 4, experts: int = 4, top_k: int = 1):
+    def __init__(self, d: int, mlp_mult: int = 4, experts: int = 4, top_k: int = 1,
+                 shared_experts: int = 0, shared_mlp_mult: int = 0):
         super().__init__()
         self.d = int(d)
         self.mlp_mult = max(1, int(mlp_mult))
@@ -2279,11 +2822,69 @@ class MoEFFN(nn.Module):
             nn.Sequential(nn.Linear(self.d, hidden), nn.ReLU(), nn.Linear(hidden, self.d))
             for _ in range(self.num_experts)
         ])
+        # Shared experts (DeepSeek/ST-MoE style): always-on FFN added to the routed
+        # output, giving every token a consistent fallback representation -> lower
+        # routing variance, smoother optimization. Output layer is ZERO-INITIALISED so
+        # the shared path is a no-op at step 0, making it mergeable into an existing
+        # checkpoint without disruption (it then learns to contribute).
+        self.num_shared = max(0, int(shared_experts))
+        if self.num_shared > 0:
+            shidden = max(1, int(shared_mlp_mult) or self.mlp_mult) * self.d
+            self.shared = nn.ModuleList([
+                nn.Sequential(nn.Linear(self.d, shidden), nn.ReLU(), nn.Linear(shidden, self.d))
+                for _ in range(self.num_shared)
+            ])
+            for blk in self.shared:
+                nn.init.zeros_(blk[2].weight); nn.init.zeros_(blk[2].bias)
+        else:
+            self.shared = None
+        # Detached FFN input stashed each training forward; the router aux loss is
+        # recomputed OUTSIDE the gradient-checkpoint boundary by _collect_moe_aux().
+        self.last_router_input = None
+        # Inference-only expert streaming: block-stream can keep only router/shared
+        # paths resident and page selected routed experts on demand.
+        self.expert_stream = False
+        self.expert_stream_empty_cache = True
+        self.expert_stream_stats = {"loads": 0, "tokens": 0}
+
+    def set_expert_stream(self, enabled: bool, empty_cache: bool = True):
+        self.expert_stream = bool(enabled)
+        self.expert_stream_empty_cache = bool(empty_cache)
+        return self
+
+    def _run_expert(self, expert, rows):
+        if self.expert_stream and torch.is_tensor(rows) and rows.is_cuda:
+            expert.to(rows.device)
+            try:
+                out = expert(rows)
+            finally:
+                expert.to("cpu")
+                self.expert_stream_stats["loads"] = int(self.expert_stream_stats.get("loads", 0)) + 1
+                self.expert_stream_stats["tokens"] = int(self.expert_stream_stats.get("tokens", 0)) + int(rows.size(0))
+                if self.expert_stream_empty_cache and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            return out
+        return expert(rows)
+
+    def _shared_out(self, flat):
+        if self.shared is None:
+            return 0.0
+        s = self.shared[0](flat)
+        for blk in self.shared[1:]:
+            s = s + blk(flat)
+        return s
 
     def forward(self, x):
         orig_shape = x.shape
         flat = x.reshape(-1, orig_shape[-1])
-        scores = self.router(flat.float())
+        if self.training:
+            # Stash the detached input (no autograd graph) so the load-balance loss
+            # can be recomputed after the block forward. Computing it here would run
+            # without grad (checkpoint's no-grad first pass) or pin block activations
+            # across the checkpoint boundary and blow up VRAM.
+            self.last_router_input = flat.detach()
+        router_in = flat.to(self.router.weight.dtype) if flat.dtype != self.router.weight.dtype else flat
+        scores = self.router(router_in).float()
 
         if self.top_k == 1:
             probs = scores.softmax(dim=-1)
@@ -2297,7 +2898,9 @@ class MoEFFN(nn.Module):
                 # Keep the forward value equal to the selected expert while
                 # sending a straight-through gradient into the top-1 router.
                 gate_st = (gate / gate.detach()).unsqueeze(-1)
-                out[mask] = expert(flat[mask]) * gate_st
+                out[mask] = self._run_expert(expert, flat[mask]) * gate_st
+            if self.shared is not None:
+                out = out + self._shared_out(flat)
             return out.reshape(orig_shape)
 
         vals, idx = torch.topk(scores, k=self.top_k, dim=-1)
@@ -2310,7 +2913,9 @@ class MoEFFN(nn.Module):
                 rows = (chosen == expert_id).nonzero(as_tuple=False).flatten()
                 if rows.numel() == 0:
                     continue
-                out.index_add_(0, rows, expert(flat.index_select(0, rows)) * weight.index_select(0, rows))
+                out.index_add_(0, rows, self._run_expert(expert, flat.index_select(0, rows)) * weight.index_select(0, rows))
+        if self.shared is not None:
+            out = out + self._shared_out(flat)
         return out.reshape(orig_shape)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
@@ -2343,6 +2948,38 @@ class MoEFFN(nn.Module):
         )
 
 
+def _collect_moe_aux(model, aux_coef=0.0, z_coef=0.0):
+    """Sum and clear the MoE load-balance / router-z losses.
+
+    Recomputes the router on the detached FFN input stashed during the forward,
+    so it works with gradient checkpointing (router logits are available WITH grad
+    here, outside the checkpointed region) and pins no block activations (the input
+    is detached, so only router.weight receives gradient). Returns a scalar tensor
+    to add to the loss before backward(), or 0.0 when disabled / nothing stashed.
+    Verified on a 4090 (28L/d1280, AMP+grad_checkpoint): peak VRAM delta ~1MB.
+    """
+    total = None
+    for m in model.modules():
+        if isinstance(m, MoEFFN):
+            inp = m.last_router_input
+            m.last_router_input = None
+            if inp is None or (aux_coef <= 0 and z_coef <= 0):
+                continue
+            router_in = inp.to(m.router.weight.dtype) if inp.dtype != m.router.weight.dtype else inp
+            scores = m.router(router_in).float()
+            probs = scores.softmax(dim=-1)
+            importance = probs.mean(dim=0)
+            top1 = probs.argmax(dim=-1)
+            load = torch.bincount(top1, minlength=m.num_experts).to(importance.dtype) / max(1, top1.numel())
+            if aux_coef > 0:
+                lb = aux_coef * m.num_experts * (load.detach() * importance).sum()
+                total = lb if total is None else total + lb
+            if z_coef > 0:
+                zl = z_coef * (torch.logsumexp(scores, dim=-1) ** 2).mean()
+                total = zl if total is None else total + zl
+    return total if total is not None else 0.0
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -2361,6 +2998,8 @@ class Block(nn.Module):
         moe_experts: int = DEFAULT_MOE_EXPERTS,
         moe_top_k: int = DEFAULT_MOE_TOP_K,
         moe_mlp_mult: int = DEFAULT_MOE_MLP_MULT,
+        moe_shared_experts: int = 0,
+        moe_shared_mlp_mult: int = 0,
         tie_kv: bool = False,
     ):
         super().__init__()
@@ -2380,7 +3019,8 @@ class Block(nn.Module):
             tie_kv=tie_kv,
         )
         self.ff = (
-            MoEFFN(d, mlp_mult=moe_mlp_mult, experts=moe_experts, top_k=moe_top_k)
+            MoEFFN(d, mlp_mult=moe_mlp_mult, experts=moe_experts, top_k=moe_top_k,
+                   shared_experts=moe_shared_experts, shared_mlp_mult=moe_shared_mlp_mult)
             if moe_ffn else nn.Sequential(nn.Linear(d, 4 * d), nn.ReLU(), nn.Linear(4 * d, d))
         )
 
@@ -2417,6 +3057,8 @@ class Encoder(nn.Module):
         moe_experts: Optional[int] = None,
         moe_top_k: Optional[int] = None,
         moe_mlp_mult: Optional[int] = None,
+        moe_shared_experts: Optional[int] = None,
+        moe_shared_mlp_mult: Optional[int] = None,
         tie_kv: Optional[bool] = None,
     ):
         super().__init__()
@@ -2434,6 +3076,11 @@ class Encoder(nn.Module):
         moe_experts = max(1, int(moe_experts))
         moe_top_k = min(max(1, int(moe_top_k)), moe_experts)
         moe_mlp_mult = max(1, int(moe_mlp_mult))
+        if moe_shared_experts is None:
+            moe_shared_experts = int(cfg.get("moe_shared_experts", 0))
+        if moe_shared_mlp_mult is None:
+            moe_shared_mlp_mult = int(cfg.get("moe_shared_mlp_mult", 0))
+        moe_shared_experts = max(0, int(moe_shared_experts))
         self.emb = nn.Embedding(VOCAB, d)
         self.blocks = nn.ModuleList([
             Block(
@@ -2452,6 +3099,8 @@ class Encoder(nn.Module):
                 moe_experts=moe_experts,
                 moe_top_k=moe_top_k,
                 moe_mlp_mult=moe_mlp_mult,
+                moe_shared_experts=moe_shared_experts,
+                moe_shared_mlp_mult=moe_shared_mlp_mult,
                 tie_kv=bool(tie_kv),
             )
             for _ in range(l)
@@ -2471,6 +3120,7 @@ class Encoder(nn.Module):
         self.moe_experts = moe_experts
         self.moe_top_k = moe_top_k
         self.moe_mlp_mult = moe_mlp_mult
+        self.moe_shared_experts = moe_shared_experts
         self.anchor_memory_enabled = bool(anchor_memory)
         self.anchor_stride = int(anchor_stride)
         self.anchor_max = int(anchor_max)
@@ -2711,11 +3361,42 @@ def _expand_dense_ffn_to_moe_state_dict(sd: dict, target_sd: dict) -> dict:
     return out
 
 
+def _reconcile_shared_expert_keys(sd: dict, target_sd: dict) -> dict:
+    """Warm-start compat between shared-expert (4.3) and shared-less (4.2) checkpoints.
+
+    - Shared-less checkpoint into a model WITH shared experts: fill the missing
+      `.ff.shared.` keys from the freshly initialised module values. The shared
+      output layer is zero-initialised, so the warm-started model is numerically
+      identical to the source checkpoint at step 0 (it then learns to contribute).
+    - Shared-expert checkpoint into a model WITHOUT them: drop the `.ff.shared.`
+      keys (everything transferable is kept; only the shared path is shed).
+    """
+    if not isinstance(sd, dict) or not isinstance(target_sd, dict):
+        return sd
+    out = dict(sd)
+    filled = 0
+    dropped = 0
+    for key, target in target_sd.items():
+        if isinstance(key, str) and ".ff.shared." in key and key not in out and torch.is_tensor(target):
+            out[key] = target.detach().clone()
+            filled += 1
+    for key in list(out.keys()):
+        if isinstance(key, str) and ".ff.shared." in key and key not in target_sd:
+            out.pop(key)
+            dropped += 1
+    if filled:
+        print(f"[warm-start] shared experts: {filled} keys init fresh (zero-init no-op)", flush=True)
+    if dropped:
+        print(f"[warm-start] shared experts: {dropped} checkpoint keys dropped (model has none)", flush=True)
+    return out
+
+
 def _prepare_core_state_dict_for_load(core: nn.Module, sd: dict) -> dict:
     sd = _strip_orig_mod_prefix(sd)
     sd = _fuse_qkv_in_state_dict(dict(sd)) if isinstance(sd, dict) else sd
     if isinstance(sd, dict):
         sd = _expand_dense_ffn_to_moe_state_dict(sd, core.state_dict())
+        sd = _reconcile_shared_expert_keys(sd, core.state_dict())
     return sd
 
 
@@ -2866,6 +3547,178 @@ def _prune_deltas(save_dir: pathlib.Path, phase_name: str, max_deltas: int):
     if max_deltas is None or max_deltas <= 0:
         return
     _prune_delta_files_to_count(save_dir, phase_name, max_deltas)
+
+
+def _pinned_basenames(save_dir: pathlib.Path) -> set:
+    try:
+        txt = (save_dir / ".pinned").read_text()
+        return {ln.strip().split("/")[-1] for ln in txt.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")}
+    except Exception:
+        return set()
+
+
+def _disk_hygiene(save_dir, phase_name: str, args, reason: str = ""):
+    """In-file disk auto-prune so the training disk never wedges (a full disk makes
+    Python unable to even start -> watchdog crash-loop). All AGILLM-4.2 disk pruning
+    lives here in the single file rather than an external janitor that can silently die.
+
+    Conservative: removes orphan *.tmp partial writes, full checkpoints beyond
+    --max_ckpts, deltas beyond --delta_max_keep, stale side-cycle rounds and applied
+    async-update artifacts, and escalates under --disk_free_floor_gb. NEVER deletes the
+    newest full checkpoint, the resume/seed deltas, files younger than 2 min, or anything
+    listed in <save_dir>/.pinned. Best-effort: never raises into the training loop."""
+    import shutil, glob as _glob
+    try:
+        save_dir = pathlib.Path(save_dir)
+        ws = save_dir.parent
+        pinned = _pinned_basenames(save_dir)
+        floor = float(getattr(args, "disk_free_floor_gb", 0.0) or 0.0)
+        now = time.time()
+
+        def free_gb():
+            try:
+                return shutil.disk_usage(str(save_dir)).free / (1024 ** 3)
+            except Exception:
+                return 1e9
+
+        def young(p, secs=120):
+            try:
+                return (now - p.stat().st_mtime) < secs
+            except Exception:
+                return True
+
+        def rm(p):
+            try:
+                if p.name in pinned:
+                    return False
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink()
+                print(f"  [disk] pruned {p.name}", flush=True)
+                return True
+            except Exception:
+                return False
+
+        def newest_first(paths):
+            return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
+
+        # 1) orphan partial writes (a live save's *.tmp is younger than 2 min)
+        for t in save_dir.glob("*.tmp"):
+            if not young(t):
+                rm(t)
+        # 2) full checkpoints beyond --max_ckpts (keep newest)
+        keep_full = max(1, int(getattr(args, "max_ckpts", 2) or 2))
+        fulls = newest_first(list(save_dir.glob(f"{phase_name}_step*.pt")))
+        for p in fulls[keep_full:]:
+            if not young(p):
+                rm(p)
+        # 3) deltas beyond --delta_max_keep
+        keep_delta = max(1, int(getattr(args, "delta_max_keep", 1) or 1))
+        deltas = newest_first(list(save_dir.glob(f"{phase_name}_delta_step*.pt")))
+        for p in deltas[keep_delta:]:
+            if not young(p):
+                rm(p)
+        # 4) transient side artifacts (side-cycle rounds, applied async updates)
+        rounds = ws / "agillm41_side_rounds"
+        rdirs = newest_first([d for d in rounds.glob("side_cycle_*") if d.is_dir()]) if rounds.exists() else []
+        for p in rdirs[2:]:
+            rm(p)
+        su = ws / "agillm41_side_updates"
+        inc = su / "incoming"
+        if inc.exists():
+            for p in newest_first(list(inc.glob("*.pt")))[4:]:
+                if not young(p):
+                    rm(p)
+        for sub in ("accepted", "rejected"):
+            d = su / sub
+            if d.exists():
+                for p in d.glob("*"):
+                    if not young(p, 600):
+                        rm(p)
+        # 5) escalate under the free-space floor (transient + extra ckpts only)
+        if floor > 0 and free_gb() < floor:
+            print(f"  [disk] below floor {floor:.0f}GB (free {free_gb():.1f}GB){(' ' + reason) if reason else ''}; escalating", flush=True)
+            for p in rdirs[1:]:
+                rm(p)
+            for p in newest_first(list(save_dir.glob(f"{phase_name}_delta_step*.pt")))[1:]:
+                if not young(p):
+                    rm(p)
+            for p in newest_first(list(save_dir.glob(f"{phase_name}_step*.pt")))[1:]:
+                if not young(p):
+                    rm(p)
+            print(f"  [disk] after escalation: {free_gb():.1f}GB free", flush=True)
+    except Exception as e:
+        print(f"[disk-hygiene] error: {e}", flush=True)
+
+def _build_val_set(source, chat_cfg, args, block):
+    """Capture a fixed held-out token sample (val_seed stream) as (1, block+1) CPU batches.
+    A fixed sample re-evaluated periodically gives a comparable loss curve over training."""
+    n = int(getattr(args, "val_tokens", 0) or 0)
+    if n <= 0:
+        return []
+    want = max(1, n // (block + 1)) * (block + 1)
+    val_source = str(getattr(args, "val_source", "") or "").strip()
+    use_hot_config = not bool(val_source)
+    val_source = val_source or source
+    print(
+        f"[val] building held-out set from {val_source} "
+        f"(hot_config={'on' if use_hot_config else 'off'}, seed {getattr(args, 'val_seed', 1337)})",
+        flush=True,
+    )
+    toks = []
+    try:
+        for t in token_stream(
+            val_source, want, seed=int(getattr(args, "val_seed", 1337)),
+            chat=chat_cfg.get("chat", False),
+            chat_messages_key=chat_cfg.get("key", "messages"),
+            sft_add_generation_prompt=chat_cfg.get("gen_prompt", False),
+            dataset_field_text=chat_cfg.get("text_field", "text"),
+            streaming=True,
+            use_hot_config=use_hot_config,
+        ):
+            toks.append(int(t))
+            if len(toks) >= want:
+                break
+    except Exception as e:
+        print(f"[val] failed to build val set ({type(e).__name__}: {e}); validation disabled", flush=True)
+        return []
+    batches = [torch.tensor(toks[i:i + block + 1], dtype=torch.long).unsqueeze(0)
+               for i in range(0, len(toks) - block, block + 1)]
+    print(f"[val] held-out set ready: {len(batches)} batches x {block + 1} tokens (seed {getattr(args, 'val_seed', 1337)})", flush=True)
+    return batches
+
+
+def _run_validation(core, ar_h, val_batches, args, step):
+    """Full-stack AR cross-entropy on the fixed held-out batches (no_grad, eval mode)."""
+    if not val_batches:
+        return None
+    was_training = core.training
+    core.eval(); ar_h.eval()
+    tot_ce, tot_tok = 0.0, 0
+    try:
+        with torch.no_grad():
+            for ids_cpu in val_batches:
+                ids = ids_cpu.to(DEV)
+                with amp(args.amp):
+                    h = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)))
+                    ce = fused_ce(h[:, :-1], ar_h.proj.weight, ids[:, 1:])
+                ntok = ids.size(1) - 1
+                tot_ce += float(ce.detach()) * ntok
+                tot_tok += ntok
+    except Exception as e:
+        print(f"[val] eval error ({type(e).__name__}: {e}); skipping this round", flush=True)
+        if was_training:
+            core.train(); ar_h.train()
+        return None
+    if was_training:
+        core.train(); ar_h.train()
+    ce = tot_ce / max(1, tot_tok)
+    ppl = math.exp(min(20.0, ce))
+    print(f"[val] step={step} tokens={tot_tok} ce={ce:.4f} ppl={ppl:.2f}", flush=True)
+    return ce
+
 
 def _load_module_state_compatible(module: nn.Module, state: dict, label: str = "module") -> int:
     """Load matching tensors only; skip obsolete untied vocab matrices for tied heads."""
@@ -3225,11 +4078,107 @@ def _optimizer_param_groups(core, ar_h, sat_h, lr_core: float, lr_head: float, n
         add(nat_h.parameters(), lr_head)
     return groups
 
+class PowerStep(torch.optim.Optimizer):
+    """Memory-efficient optimizer (arXiv:2605.10335): heavy-ball momentum + signed
+    power transform, a SINGLE buffer (no Adam second moment). Update:
+        m_t = gamma*m_{t-1} + g_t ;  theta -= lr * (sign(m)*|m|^beta + wd*theta)
+    beta in (0,1) gives Adam-like coordinate adaptivity; beta=1 -> SGD-momentum,
+    beta=0 -> signSGD-momentum. Half the optimizer state of Adam.
+
+    Faithful AGILLM-4.2 dblock-step benchmark (small model, real EDM objective, bf16):
+    converged faster and to a LOWER loss than AdamW/paged_adamw8bit (EMA 6.6 vs 8.7-9.5).
+    Note: its update scale differs from Adam, so it needs its own LR (~1e-3 vs Adam's
+    3e-4). The fp32 momentum buffer here lives in VRAM (~+3GB at 1B params); for the
+    24GB 4090 a paged or int8-quantized buffer (per the paper) is the deployment path."""
+    def __init__(self, params, lr=1e-3, momentum=0.9, beta=0.1, weight_decay=0.0,
+                 int8=False, paged=False):
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError(f"beta must be in [0,1], got {beta}")
+        if int8 and paged:
+            raise ValueError("choose at most one of PowerStep int8 / paged")
+        # Memory modes for the single momentum buffer (VRAM is the constraint; RAM is cheap):
+        #   default  -> fp32 buffer in VRAM (fastest).
+        #   int8=True -> blockwise-int8 buffer in VRAM (paper's headline; ~1/4 VRAM).
+        #   paged=True -> fp32 buffer in pinned CPU RAM (~0 persistent VRAM; spends RAM+PCIe).
+        self._int8 = bool(int8); self._paged = bool(paged)
+        if self._int8:
+            import bitsandbytes.functional as _bnbF
+            self._bnbF = _bnbF
+        super().__init__(params, dict(lr=lr, momentum=momentum, beta=beta, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        EPS = 1e-12
+        for group in self.param_groups:
+            lr = group["lr"]; gamma = group["momentum"]; beta = group["beta"]; wd = group["weight_decay"]
+            if self._int8 or self._paged:
+                # Per-tensor path (blockwise-int8 in VRAM, or fp32 buffer in CPU RAM).
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    g = p.grad
+                    st = self.state[p]
+                    if self._int8:
+                        m = (torch.zeros_like(p, dtype=torch.float32) if "mq" not in st
+                             else self._bnbF.dequantize_blockwise(st["mq"], st["mstate"]))
+                        m.mul_(gamma).add_(g.float())
+                        u = (m * (m.abs() + EPS).pow(beta - 1.0)).to(p.dtype)
+                        st["mq"], st["mstate"] = self._bnbF.quantize_blockwise(m)
+                    else:
+                        if "m" not in st:
+                            st["m"] = torch.zeros(p.shape, dtype=torch.float32,
+                                                  pin_memory=torch.cuda.is_available())
+                        m = st["m"].to(p.device, non_blocking=True)
+                        m.mul_(gamma).add_(g.float())
+                        u = (m * (m.abs() + EPS).pow(beta - 1.0)).to(p.dtype)
+                        st["m"].copy_(m, non_blocking=True)
+                    if wd != 0:
+                        p.mul_(1.0 - lr * wd)
+                    p.add_(u, alpha=-lr)
+                continue
+            # Fast multi-tensor (foreach) path for the default in-VRAM fp32 buffer:
+            # batches the elementwise update across all params -> few kernel launches,
+            # matching fused optimizers instead of one launch set per parameter.
+            params, grads, ms = [], [], []
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                st = self.state[p]
+                if "m" not in st:
+                    st["m"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                params.append(p); grads.append(p.grad); ms.append(st["m"])
+            if not params:
+                continue
+            # m = gamma*m + g
+            torch._foreach_mul_(ms, gamma)
+            torch._foreach_add_(ms, grads)
+            # u = sign(m)*|m|^beta = m * (|m|+eps)^(beta-1)   (avoids a separate sign pass)
+            absm = torch._foreach_abs(ms)
+            torch._foreach_add_(absm, EPS)
+            torch._foreach_pow_(absm, beta - 1.0)
+            us = torch._foreach_mul(ms, absm)
+            if wd != 0:
+                torch._foreach_mul_(params, 1.0 - lr * wd)
+            torch._foreach_add_(params, us, alpha=-lr)
+        return loss
+
+
 def make_optimizer(args, core, ar_h, sat_h, lr_core: float, lr_head: float, nat_h=None):
     groups = _optimizer_param_groups(core, ar_h, sat_h, lr_core, lr_head, nat_h)
     opt_name = getattr(args, "optimizer", "adamw")
     if opt_name == "adamw":
         return torch.optim.AdamW(groups)
+    if opt_name == "powerstep":
+        return PowerStep(groups,
+                         momentum=float(getattr(args, "powerstep_momentum", 0.9)),
+                         beta=float(getattr(args, "powerstep_beta", 0.1)),
+                         weight_decay=float(getattr(args, "weight_decay", 0.0) or 0.0),
+                         int8=bool(getattr(args, "powerstep_int8", False)),
+                         paged=bool(getattr(args, "powerstep_paged", False)))
     if opt_name in {"adamw8bit", "paged_adamw8bit"}:
         try:
             import bitsandbytes as bnb
@@ -3275,8 +4224,17 @@ def _train_phase(
         if total_tokens_needed <= seen_tok:
             print(f"[{phase_name}] target {total_tokens_needed} already reached.")
             return start_step, seen_tok, resume_wall_time
+    data_seed = int(getattr(args, "data_seed", 42))
+    if data_seed < 0:
+        # Streaming restarts from the dataset head with a fixed shuffle seed, so every
+        # restart re-trains the same early data. Derive a per-resume seed instead:
+        # deterministic for a given checkpoint, different across restarts.
+        data_seed = 42 + int(start_step)
+        print(f"[data] per-restart shuffle seed {data_seed} (derived from resume step)", flush=True)
+    val_batches = _build_val_set(source, chat_cfg, args, BLOCK)
+    last_val_mono = time.monotonic()
     stream = token_stream(
-        source, total_tokens_needed, seed=42,
+        source, total_tokens_needed, seed=data_seed,
         chat=chat_cfg.get("chat", False),
         chat_messages_key=chat_cfg.get("key", "messages"),
         sft_add_generation_prompt=chat_cfg.get("gen_prompt", False),
@@ -3298,6 +4256,9 @@ def _train_phase(
     last_save_mono = time.monotonic() - (now_wall - (resume_wall_time or now_wall))
     last_delta_step = start_step
     last_heartbeat_mono = time.monotonic()
+    _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="startup")
+    if val_batches:
+        _run_validation(core, ar_h, val_batches, args, step)
     print(f"[{phase_name}] Starting. Goal: {total_tokens_needed:,} tokens. Batch={BATCH}, Block={BLOCK}")
     print(
         f"[{phase_name}] AR_ONLY={args.ar_only}, SAT_EVERY={args.sat_every}, "
@@ -3369,6 +4330,9 @@ def _train_phase(
                     logits_ar = ar_h(h_ar)[:, :-1]
                     loss_ar = ce_tok(logits_ar.reshape(-1, VOCAB), tgt_ar[:, 1:].reshape(-1))
                 loss_value = float(loss_ar.detach().item())
+                _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+                if torch.is_tensor(_aux):
+                    loss_ar = loss_ar + _aux.to(loss_ar.dtype)
                 scaler.scale(loss_ar).backward()
                 del h_ar, logits_ar, loss_ar
                 do_sat = (not args.ar_only) and (args.sat_every <= 1 or ((step + 1) % args.sat_every == 0))
@@ -3377,12 +4341,25 @@ def _train_phase(
                     # only one core-forward activation graph live at a time on 24GB cards.
                     with amp(args.amp):
                         h_sat = core(ids, sat_mask(ids.size(1), structured=use_structured_masks(args)))
-                        logits_sat, gate = sat_h(h_sat[:, -SAT_BLOCK:])
-                        tgt_sat = ids[:, 1:SAT_BLOCK+1]
+                        sat_ctx = h_sat[:, :-SAT_BLOCK]
+                        tgt_sat = ids[:, SAT_BLOCK:]
+                        if sat_ctx.size(1) == 0 or sat_ctx.size(1) != tgt_sat.size(1):
+                            sat_ctx = h_sat[:, :-1]
+                            tgt_sat = ids[:, 1:]
+                        logits_sat = sat_h.proj(sat_ctx)
                         loss_sat = ce_tok(logits_sat.reshape(-1, VOCAB), tgt_sat.reshape(-1))
-                        if gate is not None:
-                            loss_sat += EMIT_LAMBDA * ce_gate(gate, torch.ones(ids.size(0), device=DEV, dtype=torch.long))
+                        if sat_h.gate is not None:
+                            sat_gate_ctx = sat_ctx[:, ::SAT_BLOCK]
+                            gate_targets = torch.ones(
+                                sat_gate_ctx.numel() // sat_gate_ctx.size(-1), device=DEV, dtype=torch.long
+                            )
+                            loss_sat += EMIT_LAMBDA * ce_gate(
+                                sat_h.gate(sat_gate_ctx.reshape(-1, sat_gate_ctx.size(-1))), gate_targets
+                            )
                     loss_value += float(loss_sat.detach().item())
+                    _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+                    if torch.is_tensor(_aux):
+                        loss_sat = loss_sat + _aux.to(loss_sat.dtype)
                     scaler.scale(loss_sat).backward()
                     del h_sat, logits_sat, loss_sat
                 do_nat = (
@@ -3410,6 +4387,9 @@ def _train_phase(
                         loss_nat = F.cross_entropy(logits_nat[mask].float(), nat_ids[mask])
                         loss_nat = float(args.nat_loss_weight) * loss_nat
                     loss_value += float(loss_nat.detach().item())
+                    _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+                    if torch.is_tensor(_aux):
+                        loss_nat = loss_nat + _aux.to(loss_nat.dtype)
                     scaler.scale(loss_nat).backward()
                     del nat_ids, nat_in, mask, h_nat, logits_nat, loss_nat
                 scaler.unscale_(opt)
@@ -3485,6 +4465,53 @@ def _train_phase(
                     )
                 except Exception:
                     mem = ""
+            try:
+                heartbeat_payload = {
+                    "schema": "agillm.run_state.v1",
+                    "model": "AGILLM4.3",
+                    "phase": "training",
+                    "trainer_phase": phase_name,
+                    "pid": int(os.getpid()),
+                    "step": int(step),
+                    "seen_tok": int(seen_tok),
+                    "loss": float(loss_value),
+                    "batch_size": int(BATCH),
+                    "block": int(BLOCK),
+                    "dblock": bool(getattr(args, "dblock", False)),
+                    "structured_masks": bool(use_structured_masks(args)),
+                    "device": str(DEV),
+                    "save_dir": str(args.save_dir),
+                    "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+                if DEV.type == "cuda":
+                    try:
+                        heartbeat_payload["gpu"] = {
+                            "allocated_gb": round(torch.cuda.memory_allocated() / (1024**3), 4),
+                            "reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 4),
+                            "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / (1024**3), 4),
+                        }
+                    except Exception:
+                        pass
+                hb_path = pathlib.Path(args.save_dir) / "run_state.json"
+                hb_tmp = hb_path.with_suffix(".json.tmp")
+                hb_tmp.write_text(json.dumps(heartbeat_payload, sort_keys=True) + "\n")
+                hb_tmp.replace(hb_path)
+                top_path = pathlib.Path(args.save_dir).parent / "agillm43_run_state.json"
+                merged = {}
+                if top_path.exists():
+                    try:
+                        merged = json.loads(top_path.read_text())
+                    except Exception:
+                        merged = {}
+                if isinstance(merged, dict):
+                    merged.update(heartbeat_payload)
+                    merged["phase"] = "training"
+                    merged["destructive_actions_allowed"] = False
+                    top_tmp = top_path.with_suffix(".json.tmp")
+                    top_tmp.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
+                    top_tmp.replace(top_path)
+            except Exception as exc:
+                print(f"[heartbeat-json] warning: {exc}", flush=True)
             print(
                 f"[heartbeat] phase={phase_name} pid={os.getpid()} step={step} "
                 f"seen_tok={seen_tok} loss={loss_value:.3f} B={BATCH} L={BLOCK} "
@@ -3492,6 +4519,10 @@ def _train_phase(
                 flush=True,
             )
             last_heartbeat_mono = now_mono
+        if val_batches and int(getattr(args, "val_every_sec", 0) or 0) > 0 and \
+                (time.monotonic() - last_val_mono) >= int(args.val_every_sec):
+            _run_validation(core, ar_h, val_batches, args, step)
+            last_val_mono = time.monotonic()
         _flush_sentinel = pathlib.Path(args.save_dir) / "FLUSH_NOW"
         if _flush_flag[0] or _flush_sentinel.exists():
             _flush_flag[0] = False
@@ -3501,6 +4532,7 @@ def _train_phase(
                 pass
             _ck_name = f"{phase_name}_step{step:08d}.pt"
             _flush_delta()
+            _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-flush-save")
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
             save_ckpt(pathlib.Path(args.save_dir) / _ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
                       meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights})
@@ -3513,6 +4545,7 @@ def _train_phase(
             if now_mono - last_save_mono >= args.save_every_sec:
                 ck_name = f"{phase_name}_step{step:08d}.pt"
                 _flush_delta()  # wait for any in-flight delta before full save
+                _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-save")
                 _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
                 save_ckpt(pathlib.Path(args.save_dir) / ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
                           meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights})
@@ -3588,6 +4621,8 @@ def train(args):
         cfg["moe_experts"] = int(getattr(args, "moe_experts", DEFAULT_MOE_EXPERTS) if requested_moe else prev_moe.get("moe_experts", DEFAULT_MOE_EXPERTS))
         cfg["moe_top_k"] = int(getattr(args, "moe_top_k", DEFAULT_MOE_TOP_K) if requested_moe else prev_moe.get("moe_top_k", DEFAULT_MOE_TOP_K))
         cfg["moe_mlp_mult"] = int(getattr(args, "moe_mlp_mult", DEFAULT_MOE_MLP_MULT) if requested_moe else prev_moe.get("moe_mlp_mult", DEFAULT_MOE_MLP_MULT))
+        cfg["moe_shared_experts"] = int(getattr(args, "moe_shared_experts", 0) if requested_moe else prev_moe.get("moe_shared_experts", 0))
+        cfg["moe_shared_mlp_mult"] = int(getattr(args, "moe_shared_mlp_mult", 0) if requested_moe else prev_moe.get("moe_shared_mlp_mult", 0))
     else:
         cfg["moe_ffn"] = False
     use_nat_head = not bool(getattr(args, "no_nat_head", False))
@@ -3747,6 +4782,13 @@ def _apply_penalties(logits, ids, n, rep_p, pres_p, freq_p):
         logits[..., uniq] = torch.where(sel > 0, sel / rep_p, sel * rep_p)
     return logits
 
+def _suppress_eos(logits, args, force=False):
+    if (force or getattr(args, "ignore_eos", False)) and EOS is not None:
+        logits = logits.clone()
+        logits[..., int(EOS)] = -1e9
+    return logits
+
+
 def _sample(logits, T, top_k, top_p, min_p, greedy):
     if greedy: return logits.argmax(-1, keepdim=True)
     probs = (logits / max(T, 1e-8)).softmax(-1)
@@ -3779,11 +4821,260 @@ def _dblock_select_block(sigma, bsig):
     return 0 if sigma < bsig[0] else len(bsig) - 2
 
 
+def _block_stream_enabled(args) -> bool:
+    return bool(getattr(args, "block_stream", False))
+
+
+def _block_stream_compute_device(args=None):
+    return DEV
+
+
+def _moe_expert_stream_enabled(args) -> bool:
+    return bool(getattr(args, "moe_expert_stream", False))
+
+
+def _dtype_from_arg(args, attr: str, flag: str):
+    name = str(getattr(args, attr, "fp32") or "fp32").lower()
+    if name in {"fp32", "float32", "none"}:
+        return None
+    if name in {"fp16", "float16", "half"}:
+        return torch.float16
+    if name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(f"unsupported {flag} {name!r}")
+
+
+def _block_stream_dtype(args):
+    return _dtype_from_arg(args, "block_stream_dtype", "--block_stream_dtype")
+
+
+def _infer_dtype(args):
+    return _dtype_from_arg(args, "infer_dtype", "--infer_dtype")
+
+
+def _block_stream_empty_cache(args) -> bool:
+    return bool(getattr(args, "block_stream_empty_cache", True)) and torch.cuda.is_available()
+
+
+def _block_stream_kv_cache_enabled(args) -> bool:
+    return bool(getattr(args, "block_stream_kv_cache", True))
+
+
+def _block_stream_cache_pages_mode(args):
+    explicit = getattr(args, "block_stream_cache_pages", None)
+    if explicit is None:
+        return "auto"
+    return "on" if bool(explicit) else "off"
+
+
+def _block_stream_cache_pages_enabled(args) -> bool:
+    effective = getattr(args, "_block_stream_cache_pages_effective", None)
+    if effective is not None:
+        return bool(effective)
+    return _block_stream_cache_pages_mode(args) == "on"
+
+
+def _module_tensor_bytes(mod) -> int:
+    total = 0
+    for t in list(mod.parameters(recurse=True)) + list(mod.buffers(recurse=True)):
+        total += int(t.numel()) * int(t.element_size())
+    return total
+
+
+def _configure_block_stream_page_cache(args, core):
+    mode = _block_stream_cache_pages_mode(args)
+    if mode == "off":
+        args._block_stream_cache_pages_effective = False
+        args._block_stream_cache_pages_reason = "explicit-off"
+        return
+    if mode == "on":
+        args._block_stream_cache_pages_effective = True
+        args._block_stream_cache_pages_reason = "explicit-on"
+        return
+    if not torch.cuda.is_available() or DEV.type != "cuda":
+        args._block_stream_cache_pages_effective = False
+        args._block_stream_cache_pages_reason = "auto-no-cuda"
+        return
+    try:
+        device_index = DEV.index if getattr(DEV, "index", None) is not None else torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(device_index)
+    except (TypeError, ValueError):
+        free, total = torch.cuda.mem_get_info()
+    page_bytes = sum(_module_tensor_bytes(blk) for blk in core.blocks)
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    reusable = max(0, int(reserved) - int(allocated))
+    usable = int(free) + int(reusable)
+    # This is an incremental fit check, not total model size. At this point the
+    # embedding, heads, CUDA context, and allocator slabs are already resident;
+    # measured page-cache peak is lower than raw block parameter bytes + safety.
+    effective_page_bytes = int(page_bytes * 0.75)
+    safety = max(128 * 1024 * 1024, int(total * 0.005))
+    effective_need = effective_page_bytes + int(safety)
+    enabled = int(usable) > int(effective_need)
+    args._block_stream_cache_pages_effective = bool(enabled)
+    args._block_stream_cache_pages_reason = (
+        f"auto usable={usable/1e9:.2f}GB free={free/1e9:.2f}GB "
+        f"reuse={reusable/1e9:.2f}GB need={effective_need/1e9:.2f}GB raw={page_bytes/1e9:.2f}GB"
+    )
+
+
+def _block_stream_kv_store_device(args):
+    name = str(getattr(args, "block_stream_kv_device", "cuda") or "cuda").lower()
+    if name in {"cuda", "gpu"} and torch.cuda.is_available():
+        return DEV
+    return torch.device("cpu")
+
+
+def _block_stream_kv_to_device(kv, device):
+    if kv is None or isinstance(kv, KVBuffer):
+        return kv
+    k, v = kv
+    if k.device == device and v.device == device:
+        return kv
+    return (k.to(device, non_blocking=True), v.to(device, non_blocking=True))
+
+
+def _block_stream_kv_to_store(kv, device):
+    if kv is None or isinstance(kv, KVBuffer):
+        return kv
+    k, v = kv
+    if device.type == "cpu":
+        return (k.detach().to("cpu", non_blocking=True), v.detach().to("cpu", non_blocking=True))
+    return (k.detach(), v.detach())
+
+
+def _block_stream_layer_pages(core, args):
+    page_layers = int(getattr(args, "block_stream_page_layers", 1) or 0)
+    if page_layers <= 0:
+        return _dblock_block_layers(core, int(getattr(args, "dblock_blocks", 4) or 4))
+    page_layers = max(1, page_layers)
+    return [list(range(i, min(i + page_layers, len(core.blocks)))) for i in range(0, len(core.blocks), page_layers)]
+
+
+def _block_stream_release(mod, args):
+    mod.to("cpu")
+    if _block_stream_empty_cache(args):
+        torch.cuda.empty_cache()
+
+
+def _block_stream_load_block(block, device, args):
+    if _moe_expert_stream_enabled(args) and isinstance(getattr(block, "ff", None), MoEFFN):
+        block.ln1.to(device)
+        block.ln2.to(device)
+        block.mha.to(device)
+        block.ff.router.to(device)
+        if block.ff.shared is not None:
+            block.ff.shared.to(device)
+        for expert in block.ff.experts:
+            expert.to("cpu")
+        block.ff.set_expert_stream(True, bool(getattr(args, "moe_expert_stream_empty_cache", True)))
+        return block
+    return block.to(device)
+
+
+def _block_stream_release_block(block, args):
+    if _block_stream_cache_pages_enabled(args):
+        return
+    if isinstance(getattr(block, "ff", None), MoEFFN):
+        block.ff.set_expert_stream(False, bool(getattr(args, "moe_expert_stream_empty_cache", True)))
+    block.to("cpu")
+    if _block_stream_empty_cache(args):
+        torch.cuda.empty_cache()
+
+
+def _moe_expert_stream_stats(core):
+    loads = 0
+    tokens = 0
+    for mod in core.modules():
+        if isinstance(mod, MoEFFN):
+            st = getattr(mod, "expert_stream_stats", None) or {}
+            loads += int(st.get("loads", 0))
+            tokens += int(st.get("tokens", 0))
+    return loads, tokens
+
+
+def _moe_expert_stream_reset_stats(core):
+    for mod in core.modules():
+        if isinstance(mod, MoEFFN):
+            mod.expert_stream_stats = {"loads": 0, "tokens": 0}
+
+
+def _block_stream_maybe_anchor(core, layer_idx, x, args):
+    if core.anchor is None or layer_idx != core.anchor_position:
+        return x
+    device = _block_stream_compute_device(args)
+    core.anchor.to(device)
+    x, _ = core.anchor(x)
+    _block_stream_release(core.anchor, args)
+    return x
+
+
+@torch.no_grad()
+def _block_stream_forward(core, ids, mask, args):
+    """Run Encoder.forward while paging blocks through the compute device."""
+    device = _block_stream_compute_device(args)
+    core.emb.to(device)
+    core.ln.to(device)
+    ids = ids.to(device)
+    x = core.emb(ids)
+    for page in _block_stream_layer_pages(core, args):
+        resident = [_block_stream_load_block(core.blocks[li], device, args) for li in page]
+        try:
+            for li, blk in zip(page, resident):
+                x = _run_block(blk, x, mask, False, args)
+                x = _block_stream_maybe_anchor(core, li, x, args)
+        finally:
+            for blk in resident:
+                _block_stream_release_block(blk, args)
+    return core.ln(x)
+
+
+@torch.no_grad()
+def _block_stream_forward_cached(core, ids, mask, kv_caches, total_seq_len, args):
+    """Block-stream AR/SAT decode with KV cache.
+
+    We still page layer weights through the compute device, but avoid recomputing
+    the full prefix for every emitted token. KV tensors can stay on CUDA for speed
+    or be stored on CPU for the lowest resident VRAM.
+    """
+    device = _block_stream_compute_device(args)
+    kv_store_device = _block_stream_kv_store_device(args)
+    core.emb.to(device)
+    core.ln.to(device)
+    ids = ids.to(device)
+    x = core.emb(ids)
+    new_kvs = [None] * len(core.blocks)
+    for page in _block_stream_layer_pages(core, args):
+        resident = [_block_stream_load_block(core.blocks[li], device, args) for li in page]
+        try:
+            for li, blk in zip(page, resident):
+                kv = kv_caches[li] if kv_caches else None
+                kv = _block_stream_kv_to_device(kv, device)
+                x, kv_out = blk(x, mask, kv, use_cache=True, total_seq_len=total_seq_len)
+                x = _block_stream_maybe_anchor(core, li, x, args)
+                new_kvs[li] = _block_stream_kv_to_store(kv_out, kv_store_device)
+        finally:
+            for blk in resident:
+                _block_stream_release_block(blk, args)
+    return core.ln(x), new_kvs
+
+
 def _edm_denoise_block(core, layers, z, sigma_t, mask, args):
     cs, co, ci = _edm_pre(sigma_t)
     h = ci * z
-    for li in layers:
-        h = _run_block(core.blocks[li], h, mask, False, args)
+    if _block_stream_enabled(args):
+        device = _block_stream_compute_device(args)
+        for li in layers:
+            blk = _block_stream_load_block(core.blocks[li], device, args)
+            try:
+                h = _run_block(blk, h, mask, False, args)
+                h = _block_stream_maybe_anchor(core, li, h, args)
+            finally:
+                _block_stream_release_block(blk, args)
+    else:
+        for li in layers:
+            h = _run_block(core.blocks[li], h, mask, False, args)
     return cs * z + co * h
 
 
@@ -3845,8 +5136,18 @@ def infer(args):
         if args.frequency_penalty is None: args.frequency_penalty = 1.0
         if args.penalty_last_n is None: args.penalty_last_n = 512
         if args.var is None: args.var = False
+    min_new = int(getattr(args, "min_new", 0) or 0)
+    if args.mode == "sat":
+        min_new = max(min_new, SAT_BLOCK)
     path = _resolve_ckpt(pathlib.Path(args.ckpt)) or pathlib.Path(args.ckpt)
     sd = torch.load(path, map_location="cpu")
+    # Inference never needs optimizer/scaler state. Drop it before model construction
+    # so block-stream runs keep CPU RAM pressure lower after checkpoint load.
+    if isinstance(sd, dict):
+        sd.pop("opt", None)
+        sd.pop("scaler", None)
+        import gc as _gc
+        _gc.collect()
     # Restore tokenizer from checkpoint if available
     if "tokenizer_json" in sd:
         try:
@@ -3891,6 +5192,10 @@ def infer(args):
         print(f"│ Checkpoint: {ckpt_name:<35s} │")
         print(f"└─────────────────────────────────────────────────┘")
     print_expansion_info(cfg, tie_weights, plain=plain_output)
+    block_stream = _block_stream_enabled(args)
+    infer_dtype = None if block_stream else _infer_dtype(args)
+    resident_dtype = (infer_dtype is not None and not block_stream)
+    core_device = torch.device("cpu") if (block_stream or resident_dtype) else DEV
     core = Encoder(
         cfg,
         tie_weights=tie_weights,
@@ -3906,11 +5211,12 @@ def infer(args):
         anchor_stride=getattr(args, "anchor_stride", DEFAULT_ANCHOR_STRIDE),
         anchor_max=getattr(args, "anchor_max", DEFAULT_ANCHOR_MAX),
         anchor_position=getattr(args, "anchor_position", DEFAULT_ANCHOR_POSITION),
-    ).to(DEV)
-    ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV)
+    ).to(core_device)
+    head_device = torch.device("cpu") if resident_dtype else DEV
+    ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
     sat_head_mlp = bool(sd.get("sat_head_mlp", False) or _sat_head_mlp_from_state(sd))
-    sat_h = SATHead(cfg["d"], mlp=sat_head_mlp).to(DEV)
-    nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV) if ("nat" in sd or args.mode == "nat") else None
+    sat_h = SATHead(cfg["d"], mlp=sat_head_mlp, tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
+    nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device) if ("nat" in sd or args.mode == "nat") else None
     core.load_state_dict(_prepare_core_state_dict_for_load(core, sd["core"]))
     ar_h.load_state_dict(sd["ar"])
     _load_infer_head_state(sat_h, sd["sat"], "SATHead")
@@ -3923,6 +5229,49 @@ def infer(args):
     sat_h.eval()
     if nat_h is not None:
         nat_h.eval()
+    if resident_dtype:
+        core.to(dtype=infer_dtype)
+        ar_h.to(dtype=infer_dtype)
+        sat_h.to(dtype=infer_dtype)
+        if nat_h is not None:
+            nat_h.to(dtype=infer_dtype)
+        core.to(DEV)
+        ar_h.to(DEV)
+        sat_h.to(DEV)
+        if nat_h is not None:
+            nat_h.to(DEV)
+        print(f"[infer] infer_dtype={str(infer_dtype).replace('torch.', '')} resident=True device={DEV}")
+    if block_stream:
+        stream_dtype = _block_stream_dtype(args)
+        if stream_dtype is not None:
+            core.to(dtype=stream_dtype)
+            ar_h.to(dtype=stream_dtype)
+            sat_h.to(dtype=stream_dtype)
+            if nat_h is not None:
+                nat_h.to(dtype=stream_dtype)
+            print(f"[infer] block_stream_dtype={str(stream_dtype).replace('torch.', '')}")
+        core.emb.to(DEV)
+        core.ln.to(DEV)
+        if core.anchor is not None:
+            core.anchor.to("cpu")
+        for blk in core.blocks:
+            blk.to("cpu")
+        if _block_stream_empty_cache(args):
+            torch.cuda.empty_cache()
+        _configure_block_stream_page_cache(args, core)
+        page_desc = "dblock" if int(getattr(args, "block_stream_page_layers", 1) or 0) <= 0 else f"{int(getattr(args, 'block_stream_page_layers', 1))} layer(s)"
+        moe_desc = " moe_expert_stream=True" if _moe_expert_stream_enabled(args) else ""
+        page_cache_reason = getattr(args, "_block_stream_cache_pages_reason", "")
+        page_cache_desc = f" page_cache={_block_stream_cache_pages_enabled(args)}"
+        if page_cache_reason:
+            page_cache_desc += f" ({page_cache_reason})"
+        if _block_stream_kv_cache_enabled(args):
+            kv_desc = f" KV cache=True kv_device={_block_stream_kv_store_device(args)}"
+        else:
+            kv_desc = " KV cache=False full-prefix recompute=True"
+        print(f"[infer] block_stream=True device={DEV} page={page_desc}{moe_desc};{page_cache_desc}{kv_desc}")
+        if _moe_expert_stream_enabled(args):
+            _moe_expert_stream_reset_stats(core)
     total_params = _count_enabled_params(core, ar_h, sat_h, nat_h)
     if total_params >= 1_000_000_000:
         param_str = f"{total_params / 1_000_000_000:.2f}B"
@@ -3946,22 +5295,41 @@ def infer(args):
         print(f"Generating ({mode_str})...")
     else:
         print(f"{Colors.INFO}Generating ({mode_str})...{Colors.RESET}")
+    if (block_stream or resident_dtype) and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     start = time.time()
     if args.mode == "ar":
         _euler = getattr(args, "sampler", "ar") == "euler"
-        if not _euler:
+        block_stream_kv = block_stream and _block_stream_kv_cache_enabled(args)
+        kvs = None
+        if not _euler and block_stream_kv:
+            h, kvs = _block_stream_forward_cached(
+                core,
+                ids,
+                causal_mask(ids.size(1), structured=use_structured_masks(args)),
+                None,
+                ids.size(1),
+                args,
+            )
+        elif not _euler and not block_stream:
             h, kvs = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=ids.size(1))
         for _ in range(args.max_new):
             if _euler:
                 h = _dblock_euler_hidden(core, ids, args)
-            logits = ar_h(h)[:, -1]
+            elif block_stream and not block_stream_kv:
+                h = _block_stream_forward(core, ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), args)
+            logits = ar_h(h)[:, -1].float()
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
+            logits = _suppress_eos(logits, args)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
             ids = torch.cat([ids, nxt], 1)
-            if EOS is not None and int(nxt.item()) == int(EOS):
+            if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
                 break
             if not _euler:
-                h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+                if block_stream_kv:
+                    h, kvs = _block_stream_forward_cached(core, ids[:, -1:], None, kvs, ids.size(1), args)
+                elif not block_stream:
+                    h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
     elif args.mode == "nat":
         # Iterative mask-predict decode (CMLM): keep the prompt fixed and fill the
         # BLANK slots, committing confident predictions each pass. Unlike the
@@ -3989,13 +5357,14 @@ def infer(args):
                 args.presence_penalty,
                 args.frequency_penalty,
             )
+            logits_pos = _suppress_eos(logits_pos, args)
             return _sample(logits_pos, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
 
         for p in range(passes):
             if not remaining:
                 break
-            h = core(ids, None)
-            logits = nat_h(h)
+            h = _block_stream_forward(core, ids, None, args) if block_stream else core(ids, None)
+            logits = nat_h(h).float()
             logits[..., BLANK] = -1e9
             conf = logits.softmax(-1).amax(-1)
             k = max(1, -(-len(remaining) // (passes - p)))
@@ -4005,58 +5374,109 @@ def infer(args):
                 ids[0, pos] = int(nxt.reshape(-1)[0])
                 remaining.discard(pos)
         if remaining:
-            h = core(ids, None)
-            logits = nat_h(h)
+            h = _block_stream_forward(core, ids, None, args) if block_stream else core(ids, None)
+            logits = nat_h(h).float()
             logits[..., BLANK] = -1e9
             for pos in sorted(remaining):
                 nxt = _nat_pick(logits[:, pos, :], ids)
                 ids[0, pos] = int(nxt.reshape(-1)[0])
     else:
         cached_len = ids.size(1)
-        h, kvs = core(ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=cached_len)
+        block_stream_kv = block_stream and _block_stream_kv_cache_enabled(args)
+        if block_stream_kv:
+            h, kvs = _block_stream_forward_cached(
+                core,
+                ids,
+                sat_mask(ids.size(1), structured=use_structured_masks(args)),
+                None,
+                cached_len,
+                args,
+            )
+        elif block_stream:
+            h = _block_stream_forward(core, ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), args)
+            kvs = None
+        else:
+            h, kvs = core(ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=cached_len)
         h_buffer = h[:, -SAT_BLOCK:]
         added = 0
         stop = False
         
-        # Align to block boundary if prompt is off-boundary
-        if ids.size(1) % SAT_BLOCK != 0:
-            logits = ar_h(h)[:, -1]
+        # Align to a SAT block boundary with AR tokens before block emission.
+        while ids.size(1) % SAT_BLOCK != 0 and added < args.max_new:
+            logits = ar_h(h)[:, -1].float()
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
+            logits = _suppress_eos(logits, args, added < min_new)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
             ids = torch.cat([ids, nxt], 1)
             added += 1
-            if EOS is not None and int(nxt.item()) == int(EOS):
+            if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
                 stop = True
-            if not stop:
+                break
+            if block_stream:
+                if block_stream_kv:
+                    h, kvs = _block_stream_forward_cached(core, nxt, None, kvs, ids.size(1), args)
+                    cached_len = ids.size(1)
+                    h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
+                else:
+                    h = _block_stream_forward(core, ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), args)
+                    h_buffer = h[:, -SAT_BLOCK:]
+            else:
                 h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
                 cached_len = ids.size(1)
                 h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
             
         while added < args.max_new and not stop:
             logits_all, gate = sat_h(h_buffer)
+            logits_all = logits_all.float()
+            if gate is not None:
+                gate = gate.float()
             stride = SAT_BLOCK if (not args.var or gate is None) else (gate.softmax(-1).multinomial(1).item() + 1)
             stride = min(int(stride), logits_all.size(1))
             new_tokens = []
             for i in range(int(stride)):
-                logits = logits_all[:, i]
+                logits = logits_all[:, i].clone()
+                # BLANK is the SAT/NAT mask-filler token; with this tokenizer it is
+                # ALSO the EOS id (pad==eos==1), so an unbanned SAT head "ends" on
+                # every filler prediction while NAT (which bans BLANK) keeps going.
+                # Ban it here exactly like the NAT path does.
+                logits[..., BLANK] = -1e9
                 logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
+                logits = _suppress_eos(logits, args, added < min_new)
                 nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
                 new_tokens.append(nxt)
                 ids = torch.cat([ids, nxt], 1)
                 added += 1
-                if EOS is not None and int(nxt.item()) == int(EOS):
+                if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
                     stop = True
                     break
                 if added >= args.max_new: break
             if stop or added >= args.max_new: break
             new_ids = torch.cat(new_tokens, dim=1)
-            mask = sat_mask_cached(new_ids.size(1), cached_len, structured=use_structured_masks(args))
-            h, kvs = core(new_ids, mask, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
-            cached_len = ids.size(1)
-            h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
+            if block_stream:
+                if block_stream_kv:
+                    mask = sat_mask_cached(new_ids.size(1), cached_len, structured=use_structured_masks(args))
+                    h, kvs = _block_stream_forward_cached(core, new_ids, mask, kvs, ids.size(1), args)
+                    cached_len = ids.size(1)
+                    h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
+                else:
+                    h = _block_stream_forward(core, ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), args)
+                    h_buffer = h[:, -SAT_BLOCK:]
+            else:
+                mask = sat_mask_cached(new_ids.size(1), cached_len, structured=use_structured_masks(args))
+                h, kvs = core(new_ids, mask, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+                cached_len = ids.size(1)
+                h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
     elapsed = time.time() - start
     gen_tokens = len(ids[0]) - prompt_len
     tok_per_sec = gen_tokens / elapsed if elapsed > 0 else 0
+    if (block_stream or resident_dtype) and torch.cuda.is_available():
+        peak_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
+        peak_reserved_gb = torch.cuda.max_memory_reserved() / 1e9
+        label = "block_stream" if block_stream else "resident"
+        print(f"[infer] {label}_cuda_peak_alloc={peak_alloc_gb:.2f}GB peak_reserved={peak_reserved_gb:.2f}GB")
+        if block_stream and _moe_expert_stream_enabled(args):
+            loads, tokens = _moe_expert_stream_stats(core)
+            print(f"[infer] moe_expert_stream_loads={loads} routed_tokens={tokens}")
     all_tokens = ids[0].tolist()
     prompt_text = tok.decode(all_tokens[:prompt_len], skip_special_tokens=True)
     gen_text = tok.decode(all_tokens[prompt_len:], skip_special_tokens=True)
@@ -4084,6 +5504,483 @@ def infer(args):
 
 
 # ───────────────────────── CLI ─────────────────────────
+
+# ------------------------- AGILLM4.3 native supervisor -------------------------
+def _agillm43_now_iso():
+    import time
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _agillm43_log_json(log_path, event, **fields):
+    import json
+    from pathlib import Path
+    payload = {"event": event, "at": _agillm43_now_iso()}
+    payload.update(fields)
+    line = json.dumps(payload, separators=(",", ":"))
+    print(line, flush=True)
+    try:
+        lp = Path(log_path)
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        with lp.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _agillm43_cmdline(pid):
+    from pathlib import Path
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        return [x.decode("utf-8", "ignore") for x in raw.split(b"\0") if x]
+    except Exception:
+        return []
+
+
+def _agillm43_matching_pids(kind):
+    import os
+    from pathlib import Path
+    me = os.getpid()
+    pids = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            pid = int(proc.name)
+        except ValueError:
+            continue
+        if pid == me:
+            continue
+        cmd = _agillm43_cmdline(pid)
+        if not cmd:
+            continue
+        exe = Path(cmd[0]).name.lower()
+        if "python" not in exe:
+            continue
+        joined = " ".join(cmd)
+        if "agillm41.py" not in joined:
+            continue
+        if kind == "train" and " train " in f" {joined} ":
+            pids.append(pid)
+        elif kind == "supervise" and " supervise " in f" {joined} ":
+            pids.append(pid)
+    return sorted(set(pids))
+
+
+def _agillm43_gpu_pids():
+    import subprocess
+    pids = []
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        for line in out.splitlines():
+            line = line.strip().split(",", 1)[0].strip()
+            if line.isdigit():
+                pids.append(int(line))
+    except Exception:
+        pass
+    return pids
+
+
+def _agillm43_latest_step(save_dir):
+    import json
+    from pathlib import Path
+    try:
+        return int(json.loads((Path(save_dir) / "latest.json").read_text()).get("step", 0))
+    except Exception:
+        return 0
+
+
+def _agillm43_kill(pid, sig):
+    import os
+    try:
+        os.kill(int(pid), sig)
+        return True
+    except Exception:
+        return False
+
+
+def _agillm43_prepare_env(save_dir, side_dir):
+    import os
+    from pathlib import Path
+    env = os.environ.copy()
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    env.setdefault("TOKENIZER_ID", "deepseek-ai/DeepSeek-V4-Pro")
+    env.setdefault("AGILLM_ATTN_BACKEND", "sublinear")
+    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    shm = Path("/dev/shm")
+    if shm.is_dir() and os.access(shm, os.W_OK):
+        tmp = shm / "agillm_tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        env.update({"TMPDIR": str(tmp), "TMP": str(tmp), "TEMP": str(tmp)})
+    hf_token_path = Path("/root/.cache/huggingface/token")
+    if hf_token_path.exists():
+        token = hf_token_path.read_text(errors="ignore").strip()
+        if token:
+            env["HF_TOKEN"] = token
+            env["HUGGING_FACE_HUB_TOKEN"] = token
+
+    def _agillm43_load_secret_file(env_name, paths):
+        if env.get(env_name, "").strip():
+            return True
+        for raw_path in paths:
+            try:
+                p = Path(raw_path)
+                if p.exists():
+                    val = p.read_text(errors="ignore").strip()
+                    if val:
+                        env[env_name] = val
+                        return True
+            except Exception:
+                pass
+        return False
+
+    have_deepseek = _agillm43_load_secret_file(
+        "DEEPSEEK_API_KEY",
+        (
+            "/root/.config/agillm/deepseek_api_key",
+            "/workspace/private/deepseek_api_key",
+            "/workspace/agillm_private/deepseek_api_key",
+        ),
+    )
+    have_openrouter = _agillm43_load_secret_file(
+        "OPENROUTER_API_KEY",
+        (
+            "/root/.config/agillm/openrouter_api_key",
+            "/workspace/private/openrouter_api_key",
+            "/workspace/agillm_private/openrouter_api_key",
+        ),
+    )
+    if have_deepseek or have_openrouter:
+        env.setdefault("AGILLM_DATASET_AGENT_ROUTER", "1")
+        env.setdefault("AGILLM_DATASET_AGENT_PROVIDER", "auto")
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    for name in ("incoming", "accepted", "rejected"):
+        (Path(side_dir) / name).mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def _agillm43_prune_save_dir(save_dir):
+    import os
+    from pathlib import Path
+    d = Path(save_dir)
+    for tmp in d.glob("*.tmp"):
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+    ckpts = sorted(d.glob("pretrain_step*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
+    for old in ckpts[1:]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+
+def _agillm43_latest_checkpoint_path(save_dir):
+    import glob
+    import json
+    import os
+    from pathlib import Path
+    save = Path(save_dir)
+    src = ""
+    try:
+        src = json.loads((save / "latest.json").read_text()).get("path", "")
+    except Exception:
+        src = ""
+    if src and Path(src).exists():
+        return str(Path(src))
+    candidates = sorted(glob.glob(str(save / "pretrain_step*.pt")), key=os.path.getmtime)
+    return candidates[-1] if candidates else ""
+
+
+def _agillm43_convert_resume_delta(save_dir, log_path):
+    import os
+    import re
+    from pathlib import Path
+    import torch
+    save = Path(save_dir)
+    shm = Path(os.environ.get("SHM_DIR", "/dev/shm"))
+    if not (shm.is_dir() and os.access(shm, os.W_OK)):
+        shm = save
+    out = shm / "agillm43_resume.delta.pt"
+    mark = out.parent / ".agillm43_resume.step"
+    src = _agillm43_latest_checkpoint_path(save)
+    if not src:
+        seed = save / "agillm42_tiekv_seed.delta.pt"
+        _agillm43_log_json(log_path, "native_supervisor_resume_seed", path=str(seed))
+        return str(seed)
+    src_path = Path(src)
+    m = re.search(r"step0*([0-9]+)", src_path.name)
+    fstep = m.group(1) if m else ""
+    try:
+        st = src_path.stat()
+        src_meta = {
+            "path": str(src_path.resolve()),
+            "name": src_path.name,
+            "size": int(st.st_size),
+            "mtime_ns": int(st.st_mtime_ns),
+            "step": int(fstep) if fstep else None,
+        }
+    except Exception:
+        src_meta = {
+            "path": str(src_path),
+            "name": src_path.name,
+            "step": int(fstep) if fstep else None,
+        }
+
+    def _resume_delta_mark_matches():
+        if not (out.exists() and mark.exists()):
+            return False
+        try:
+            payload = json.loads(mark.read_text().strip() or "{}")
+        except Exception:
+            # Old marker files only stored the step number. Rebuild once so a
+            # stale delta from a failed probe cannot replay over a good full ckpt.
+            return False
+        if not isinstance(payload, dict):
+            return False
+        return all(payload.get(k) == v for k, v in src_meta.items())
+
+    if _resume_delta_mark_matches():
+        _agillm43_log_json(log_path, "native_supervisor_resume_delta_current", source=src_meta, path=str(out))
+        return str(out)
+
+    ck = torch.load(src_path, map_location="cpu", weights_only=False)
+    delta = {
+        "delta": True,
+        "weights": {k: ck[k] for k in ("core", "ar", "sat", "nat") if k in ck},
+        "step": ck.get("step", 0),
+        "seen_tok": ck.get("seen_tok", 0),
+        "cfg": ck.get("cfg"),
+        "source_checkpoint": src_meta,
+    }
+    tmp = str(out) + ".tmp"
+    torch.save(delta, tmp)
+    os.replace(tmp, out)
+    mark.write_text(json.dumps(src_meta, sort_keys=True))
+    try:
+        Path(str(out) + ".sha256").unlink()
+    except FileNotFoundError:
+        pass
+    _agillm43_log_json(log_path, "native_supervisor_resume_delta_converted", src=str(src_path), source=src_meta, path=str(out), step=int(delta.get("step", 0)))
+    return str(out)
+
+
+AGILLM43_PROFILE_CHOICES = ("normal", "sat_repair", "sat_probe")
+
+
+def _agillm43_profile_config(profile):
+    profile = str(profile or "normal").lower()
+    profiles = {
+        "normal": {
+            "ar_prob": "0.60", "sat_prob": "0.25", "nat_prob": "0.15",
+            "ar_loss_tokens": "512", "sat_loss_tokens": "512", "nat_loss_tokens": "512",
+            "sat_every": "1", "nat_every": "4",
+        },
+        "sat_repair": {
+            "ar_prob": "0.45", "sat_prob": "0.40", "nat_prob": "0.15",
+            "ar_loss_tokens": "512", "sat_loss_tokens": "1024", "nat_loss_tokens": "512",
+            "sat_every": "1", "nat_every": "4",
+        },
+        "sat_probe": {
+            "ar_prob": "0.05", "sat_prob": "0.90", "nat_prob": "0.05",
+            "ar_loss_tokens": "256", "sat_loss_tokens": "2048", "nat_loss_tokens": "256",
+            "sat_every": "1", "nat_every": "4",
+        },
+    }
+    if profile not in profiles:
+        raise ValueError(f"unknown AGILLM4.3 profile {profile!r}; choose one of {', '.join(AGILLM43_PROFILE_CHOICES)}")
+    cfg = profiles[profile].copy()
+    cfg["name"] = profile
+    return cfg
+
+
+def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", warmstart_from=None):
+    import sys
+    from pathlib import Path
+    script = str(Path(__file__).resolve())
+    incoming = str(Path(side_dir) / "incoming")
+    accepted = str(Path(side_dir) / "accepted")
+    rejected = str(Path(side_dir) / "rejected")
+    prof = _agillm43_profile_config(profile)
+    return [
+        sys.executable, "-u", script, "train",
+        "--preset", "agillm4_floor", "--tie_kv", "--resume_delta", resume_delta,
+        *(["--warmstart_from", str(warmstart_from)] if warmstart_from else []),
+        "--dblock", "--dblock_blocks", "4", "--dblock_schedule", "loss_balanced",
+        "--dblock_warmup_steps", "16", "--dblock_sigma_curriculum_steps", "2000",
+        "--dblock_log_every", "25", "--dblock_objective_mode", "stochastic",
+        "--dblock_ar_prob", prof["ar_prob"], "--dblock_sat_prob", prof["sat_prob"], "--dblock_nat_prob", prof["nat_prob"],
+        "--dblock_ar_loss_tokens", prof["ar_loss_tokens"], "--dblock_sat_loss_tokens", prof["sat_loss_tokens"], "--dblock_nat_loss_tokens", prof["nat_loss_tokens"],
+        "--moe_ffn", "--moe_experts", "2", "--moe_top_k", "1", "--moe_mlp_mult", "4",
+        "--moe_shared_experts", "1", "--moe_shared_mlp_mult", "2", "--moe_aux_coef", "0.01", "--moe_z_coef", "0.001",
+        "--tie_weights", "--batch_size", "6", "--block", "1024", "--amp", "--attn_backend", "sublinear",
+        "--sublinear_window", "128", "--sublinear_stride", "128", "--sublinear_max_anchors", "128", "--sublinear_chunk", "128",
+        "--sublinear_sinks", "4", "--sublinear_recent_anchors", "64", "--no-sublinear_pooled_landmarks",
+        "--grad_checkpoint", "--dblock_checkpoint_stride", "1", "--optimizer", "paged_adamw8bit",
+        "--loss_spike_skip", "3.0", "--sat_every", prof["sat_every"], "--nat_every", prof["nat_every"],
+        "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
+        "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
+        "--save_dir", str(save_dir), "--save_every_sec", "14400", "--heartbeat_every_sec", "300",
+        "--empty_cache_every_steps", "0", "--delta_every_steps", "25000", "--delta_max_keep", "1", "--max_ckpts", "1",
+        "--async_update_dir", incoming, "--async_update_every_steps", "100", "--async_update_alpha", "0.05",
+        "--async_update_max_per_check", "2", "--async_update_max_age_sec", "86400",
+        "--async_update_accepted_dir", accepted, "--async_update_rejected_dir", rejected,
+    ]
+
+def _agillm43_dedupe_trainers(log_path, keep_pid=None):
+    import signal
+    pids = _agillm43_matching_pids("train")
+    if len(pids) <= 1:
+        return pids
+    gpu = [p for p in _agillm43_gpu_pids() if p in pids]
+    keep = int(keep_pid) if keep_pid in pids else (gpu[0] if gpu else pids[0])
+    for pid in pids:
+        if pid == keep:
+            continue
+        _agillm43_log_json(log_path, "native_supervisor_kill_duplicate", pid=pid, keep=keep)
+        _agillm43_kill(pid, signal.SIGTERM)
+    return [keep]
+
+
+def supervise_agillm43(args):
+    import os
+    import subprocess
+    import time
+    from pathlib import Path
+    log_path = args.log
+    save_dir = args.save_dir
+    side_dir = args.side_dir
+    pause_file = Path(args.pause_file)
+    script_dir = Path(__file__).resolve().parent
+    os.chdir(script_dir)
+    env = _agillm43_prepare_env(save_dir, side_dir)
+    profile = str(getattr(args, "profile", None) or os.environ.get("AGILLM43_PROFILE", "normal"))
+    _agillm43_profile_config(profile)
+    _agillm43_log_json(log_path, "native_supervisor_start", pid=os.getpid(), save_dir=str(save_dir), side_dir=str(side_dir), profile=profile)
+    while True:
+        while pause_file.exists():
+            _agillm43_log_json(log_path, "native_supervisor_paused", pause=str(pause_file))
+            time.sleep(5)
+        if args.dedupe:
+            _agillm43_dedupe_trainers(log_path)
+        live = _agillm43_matching_pids("train")
+        if live:
+            if args.once:
+                _agillm43_log_json(log_path, "native_supervisor_existing_trainer", pids=live)
+                return 0
+            time.sleep(max(1, args.sleep_sec))
+            continue
+        _agillm43_prune_save_dir(save_dir)
+        resume_src = _agillm43_latest_checkpoint_path(save_dir)
+        resume_delta = _agillm43_convert_resume_delta(save_dir, log_path)
+        argv = _agillm43_train_argv(save_dir, side_dir, resume_delta, profile=profile, warmstart_from=resume_src)
+        _agillm43_log_json(log_path, "native_supervisor_launch", profile=profile, warmstart_from=resume_src, argv=" ".join(argv))
+        with open(log_path, "a", encoding="utf-8", buffering=1) as lf:
+            child = subprocess.Popen(argv, cwd=str(script_dir), env=env, stdout=lf, stderr=subprocess.STDOUT)
+        if args.once:
+            _agillm43_log_json(log_path, "native_supervisor_launched_once", pid=child.pid)
+            return 0
+        while child.poll() is None:
+            if args.dedupe:
+                _agillm43_dedupe_trainers(log_path, keep_pid=child.pid)
+            time.sleep(max(1, args.sleep_sec))
+        _agillm43_log_json(log_path, "native_supervisor_trainer_exit", pid=child.pid, rc=child.returncode)
+        time.sleep(max(1, args.sleep_sec))
+
+
+def hotpatch_agillm43(args):
+    import os
+    import signal
+    import subprocess
+    import time
+    from pathlib import Path
+    log_path = args.log
+    save_dir = Path(args.save_dir)
+    pause_file = Path(args.pause_file)
+    pause_file.touch()
+    _agillm43_log_json(log_path, "native_hotpatch_pause", pause=str(pause_file))
+    try:
+        pids = _agillm43_dedupe_trainers(log_path)
+        pids = _agillm43_matching_pids("train")
+        if pids:
+            gpu = [p for p in _agillm43_gpu_pids() if p in pids]
+            keep = gpu[0] if gpu else pids[0]
+            before = _agillm43_latest_step(save_dir)
+            _agillm43_log_json(log_path, "native_hotpatch_flush_requested", pid=keep, before_step=before)
+            (save_dir / "FLUSH_NOW").touch()
+            _agillm43_kill(keep, signal.SIGUSR1)
+            deadline = time.time() + args.wait_flush_sec
+            while time.time() < deadline:
+                cur = _agillm43_latest_step(save_dir)
+                if cur > before:
+                    _agillm43_log_json(log_path, "native_hotpatch_flush_done", latest_step=cur)
+                    break
+                time.sleep(5)
+            else:
+                cur = _agillm43_latest_step(save_dir)
+                _agillm43_log_json(log_path, "native_hotpatch_flush_timeout", latest_step=cur, before_step=before)
+                if not args.force:
+                    return 2
+        else:
+            _agillm43_log_json(log_path, "native_hotpatch_no_trainer")
+        for spid in _agillm43_matching_pids("supervise"):
+            if spid == os.getpid():
+                continue
+            _agillm43_log_json(log_path, "native_hotpatch_stop_supervisor", pid=spid)
+            _agillm43_kill(spid, signal.SIGTERM)
+        if args.kill_tmux:
+            subprocess.run(["tmux", "kill-session", "-t", args.tmux_session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        for pid in _agillm43_matching_pids("train"):
+            _agillm43_log_json(log_path, "native_hotpatch_stop_trainer", pid=pid)
+            _agillm43_kill(pid, signal.SIGTERM)
+        deadline = time.time() + 120
+        while time.time() < deadline and _agillm43_matching_pids("train"):
+            time.sleep(2)
+        for pid in _agillm43_matching_pids("train"):
+            _agillm43_log_json(log_path, "native_hotpatch_kill_stubborn", pid=pid)
+            _agillm43_kill(pid, signal.SIGKILL)
+        pause_file.unlink(missing_ok=True)
+        cmd = [
+            "python3", "-u", str(Path(__file__).resolve()), "supervise",
+            "--save_dir", str(save_dir), "--side_dir", args.side_dir, "--log", log_path,
+            "--pause_file", str(pause_file), "--sleep_sec", str(args.sleep_sec),
+            "--profile", str(args.profile),
+        ]
+        if args.tmux:
+            import shlex
+            quoted = " ".join(shlex.quote(part) for part in cmd)
+            subprocess.run(["tmux", "new-session", "-d", "-s", args.tmux_session, quoted], check=False)
+            if not _agillm43_matching_pids("supervise"):
+                with open(args.nohup_log, "a", encoding="utf-8") as lf:
+                    subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+                _agillm43_log_json(log_path, "native_hotpatch_start_supervisor_nohup_fallback", log=args.nohup_log)
+            else:
+                _agillm43_log_json(log_path, "native_hotpatch_start_supervisor_tmux", session=args.tmux_session)
+        else:
+            with open(args.nohup_log, "a", encoding="utf-8") as lf:
+                subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+            _agillm43_log_json(log_path, "native_hotpatch_start_supervisor_nohup", log=args.nohup_log)
+        deadline = time.time() + args.wait_start_sec
+        while time.time() < deadline:
+            live = _agillm43_matching_pids("train")
+            if len(live) == 1:
+                _agillm43_log_json(log_path, "native_hotpatch_restart_done", pid=live[0], latest_step=_agillm43_latest_step(save_dir))
+                return 0
+            if len(live) > 1:
+                _agillm43_dedupe_trainers(log_path)
+            time.sleep(3)
+        _agillm43_log_json(log_path, "native_hotpatch_restart_timeout", trainer_count=len(_agillm43_matching_pids("train")))
+        return 3
+    finally:
+        try:
+            pause_file.unlink()
+        except FileNotFoundError:
+            pass
+
 def main():
     ap = argparse.ArgumentParser(description="AGILLM Expansion Ratio Testing")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -4130,9 +6027,29 @@ def main():
                     help="Block index after which to insert anchor memory (-1 = stack middle).")
     tr.add_argument("--kv_buffer", action="store_true",
                     help="Use preallocated KV buffer instead of torch.cat-based cache growth.")
-    tr.add_argument("--optimizer", choices=["adamw", "adamw8bit", "paged_adamw8bit"], default="adamw",
-                    help="Optimizer backend. 8-bit options reduce VRAM on 24GB production runs.")
+    tr.add_argument("--optimizer", choices=["adamw", "adamw8bit", "paged_adamw8bit", "powerstep"], default="adamw",
+                    help="Optimizer backend. 8-bit options reduce VRAM on 24GB production runs. 'powerstep' (arXiv:2605.10335) uses a single momentum buffer; in a faithful dblock-step benchmark it converged below Adam, but needs its own LR (~1e-3) and an int8/paged buffer to fit at B=6.")
+    tr.add_argument("--powerstep_beta", type=float, default=0.1,
+                    help="PowerStep signed-power exponent beta in (0,1); 0.1 is the paper's recommended value.")
+    tr.add_argument("--powerstep_momentum", type=float, default=0.9,
+                    help="PowerStep heavy-ball momentum coefficient gamma.")
+    tr.add_argument("--powerstep_int8", action="store_true",
+                    help="PowerStep: store the momentum buffer as blockwise int8 in VRAM (~1/4 VRAM; needs bitsandbytes).")
+    tr.add_argument("--powerstep_paged", action="store_true",
+                    help="PowerStep: keep the momentum buffer in pinned CPU RAM (~0 persistent VRAM, spends RAM+PCIe).")
     tr.add_argument("--save_every_sec", type=int, default=DEFAULT_SAVE_SEC)
+    tr.add_argument("--disk_free_floor_gb", type=float, default=12.0,
+                    help="In-file disk auto-prune: when free space drops below this, escalate pruning of transient artifacts and old checkpoints. 0 disables the floor (routine keep-count pruning still runs).")
+    tr.add_argument("--val_tokens", type=int, default=0,
+                    help="Held-out validation set size in tokens (sampled once from --val_seed stream at startup). 0 disables validation.")
+    tr.add_argument("--val_every_sec", type=int, default=3600,
+                    help="Run held-out validation every N seconds (requires --val_tokens > 0).")
+    tr.add_argument("--val_seed", type=int, default=1337,
+                    help="Shuffle seed for the held-out validation stream (distinct from the training data seed).")
+    tr.add_argument("--val_source", default="",
+                    help="Optional validation-only dataset source. When set, bypasses hot_config so health probes are comparable across restarts.")
+    tr.add_argument("--data_seed", type=int, default=42,
+                    help="Training stream shuffle seed. -1 derives a per-restart seed from the resume step so restarts do not re-train identical early data.")
     tr.add_argument("--heartbeat_every_sec", type=int, default=300,
                     help="Print lightweight trainer heartbeat/status lines every N seconds; 0 disables.")
     tr.add_argument("--empty_cache_every_steps", type=int, default=0,
@@ -4192,6 +6109,16 @@ def main():
                     help="Router top-k experts per token when --moe_ffn is enabled.")
     tr.add_argument("--moe_mlp_mult", type=int, default=DEFAULT_MOE_MLP_MULT,
                     help="Expert hidden-size multiplier; 4 preserves dense FFN checkpoint shape for seeding.")
+    tr.add_argument("--moe_shared_experts", type=int, default=0,
+                    help="Always-on shared experts added to the routed output (DeepSeek/ST-MoE style). 0 disables. Output is zero-init so it merges into an existing checkpoint as a no-op then learns to contribute.")
+    tr.add_argument("--moe_shared_mlp_mult", type=int, default=0,
+                    help="Hidden-size multiplier for shared experts (0 = same as --moe_mlp_mult). Use a smaller value (1-2) to limit added VRAM.")
+    tr.add_argument("--moe_aux_coef", type=float, default=0.0,
+                    help="Weight for the MoE load-balance (Switch) aux loss. 0 disables (legacy). ~0.01 keeps both experts utilised under top-1 routing. Checkpoint-safe (router recomputed outside the checkpoint).")
+    tr.add_argument("--moe_z_coef", type=float, default=0.0,
+                    help="Weight for the MoE router z-loss (router-logit magnitude regularizer). 0 disables. ~0.001 stabilizes routing.")
+    tr.add_argument("--loss_spike_skip", type=float, default=0.0,
+                    help="Skip the optimizer step when the mean raw CE exceeds this multiple of its EMA (dblock path). 0 disables. ~3.0 drops pathological noisy-batch spikes.")
     tr.add_argument("--dblock", action="store_true", help="DiffusionBlocks block-wise denoising training (low VRAM).")
     tr.add_argument("--dblock_blocks", type=int, default=4, help="Partition layers into this many DiffusionBlocks blocks.")
     tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "loss_balanced"], default="loss_balanced",
@@ -4265,6 +6192,7 @@ def main():
     inf.add_argument("--ckpt", required=True)
     inf.add_argument("--prompt", required=True)
     inf.add_argument("--max_new", type=int, default=120)
+    inf.add_argument("--min_new", type=int, default=0, help="Minimum generated tokens before EOS can stop decoding. SAT enforces at least one block.")
     inf.add_argument("--temperature", type=float, default=None)
     inf.add_argument("--greedy", action="store_true")
     inf.add_argument("--top_k", type=int, default=None)
@@ -4290,6 +6218,53 @@ def main():
     inf.add_argument("--no_structured_masks", action="store_true")
     inf.add_argument("--nat_expand", type=int, default=2)
     inf.add_argument("--nat_passes", type=int, default=1)
+    inf.add_argument("--ignore_eos", action="store_true",
+                     help="Never stop on (or sample) EOS: suppress its logit and emit exactly max_new tokens. For base-model / SAT-head testing.")
+    inf.add_argument("--infer_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
+                     help="Resident inference dtype. fp16/bf16 load on CPU, convert, then move the model to CUDA to avoid fp32 VRAM spikes.")
+    inf.add_argument("--block_stream", action="store_true",
+                     help="VRAM-saving inference: keep heads/embeddings resident and page Encoder blocks through the compute device.")
+    inf.add_argument("--block_stream_page_layers", type=int, default=1,
+                     help="Layers per resident page for --block_stream. 1=lowest VRAM; 0=use --dblock_blocks pages.")
+    inf.add_argument("--block_stream_empty_cache", action=argparse.BooleanOptionalAction, default=True,
+                     help="Call torch.cuda.empty_cache() after each streamed page unload.")
+    inf.add_argument("--block_stream_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
+                     help="Weight/activation dtype for --block_stream. fp16 halves CPU->GPU transfer bytes on CUDA-capable cards.")
+    inf.add_argument("--block_stream_kv_cache", action=argparse.BooleanOptionalAction, default=True,
+                     help="Use KV cache for AR/SAT --block_stream decode instead of recomputing the full prefix each token.")
+    inf.add_argument("--block_stream_kv_device", choices=["cuda", "cpu"], default="cuda",
+                     help="Where --block_stream keeps KV cache tensors. cuda is faster; cpu minimizes resident VRAM.")
+    inf.add_argument("--block_stream_cache_pages", action=argparse.BooleanOptionalAction, default=None,
+                     help="Auto by default: keep streamed layer pages resident when VRAM allows. Use --no-block_stream_cache_pages for strict low-VRAM streaming.")
+    inf.add_argument("--moe_expert_stream", action="store_true",
+                     help="With --block_stream, keep routed MoE experts on CPU and page only selected experts through the compute device.")
+    inf.add_argument("--moe_expert_stream_empty_cache", action=argparse.BooleanOptionalAction, default=True,
+                     help="Call torch.cuda.empty_cache() after unloading each streamed MoE expert.")
+    sup = sub.add_parser("supervise", help="Native AGILLM4.3 trainer supervisor")
+    sup.add_argument("--save_dir", default="/workspace/agillm4_4090_ckpts")
+    sup.add_argument("--side_dir", default="/workspace/agillm41_side_updates")
+    sup.add_argument("--log", default="/workspace/agillm41_master_train.log")
+    sup.add_argument("--pause_file", default="/tmp/agillm43_master_watchdog.pause")
+    sup.add_argument("--sleep_sec", type=int, default=15)
+    sup.add_argument("--dedupe", action=argparse.BooleanOptionalAction, default=True)
+    sup.add_argument("--once", action="store_true")
+    sup.add_argument("--profile", choices=AGILLM43_PROFILE_CHOICES, default="normal",
+                     help="Training launch profile: normal, sat_repair, or sat_probe.")
+    hp = sub.add_parser("hotpatch", help="Flush checkpoint and restart under native AGILLM4.3 supervisor")
+    hp.add_argument("--save_dir", default="/workspace/agillm4_4090_ckpts")
+    hp.add_argument("--side_dir", default="/workspace/agillm41_side_updates")
+    hp.add_argument("--log", default="/workspace/agillm41_master_train.log")
+    hp.add_argument("--pause_file", default="/tmp/agillm43_master_watchdog.pause")
+    hp.add_argument("--wait_flush_sec", type=int, default=900)
+    hp.add_argument("--wait_start_sec", type=int, default=300)
+    hp.add_argument("--sleep_sec", type=int, default=15)
+    hp.add_argument("--profile", choices=AGILLM43_PROFILE_CHOICES, default="normal",
+                    help="Training launch profile used by the restarted supervisor.")
+    hp.add_argument("--force", action="store_true")
+    hp.add_argument("--tmux", action=argparse.BooleanOptionalAction, default=True)
+    hp.add_argument("--tmux_session", default="master_wd")
+    hp.add_argument("--kill_tmux", action=argparse.BooleanOptionalAction, default=True)
+    hp.add_argument("--nohup_log", default="/workspace/agillm41_native_supervisor.nohup")
     st = sub.add_parser("status", help="Read-only training status")
     st.add_argument("--json", dest="json_output", action="store_true")
     st.add_argument("--log", type=str, default=str(STATUS_DEFAULT_LOG))
@@ -4297,7 +6272,10 @@ def main():
     args = ap.parse_args()
     if args.cmd == "train": train(args)
     elif args.cmd == "infer": infer(args)
-    else: raise SystemExit(_emit_status(Path(args.log), Path(args.save_dir), args.json_output))
+    elif args.cmd == "supervise": raise SystemExit(supervise_agillm43(args))
+    elif args.cmd == "hotpatch": raise SystemExit(hotpatch_agillm43(args))
+    elif args.cmd == "status": raise SystemExit(_emit_status(Path(args.log), Path(args.save_dir), args.json_output))
+    else: raise SystemExit(f"unknown command: {args.cmd}")
 
 
 if __name__ == "__main__":

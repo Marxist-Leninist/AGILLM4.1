@@ -271,9 +271,29 @@ def _ppf(p):
     return float(torch.erfinv(torch.tensor(2 * p - 1.0)) * math.sqrt(2))
 
 
+def _dblock_sigma_config(args=None):
+    smin = float(getattr(args, "dblock_sigma_min", 0.002) if args is not None else 0.002)
+    smax = float(getattr(args, "dblock_sigma_max", 80.0) if args is not None else 80.0)
+    pm = float(getattr(args, "dblock_sigma_pmean", -1.2) if args is not None else -1.2)
+    ps = float(getattr(args, "dblock_sigma_pstd", 1.2) if args is not None else 1.2)
+    if not math.isfinite(smin) or smin <= 0:
+        smin = 0.002
+    if not math.isfinite(smax) or smax <= smin:
+        smax = max(80.0, smin * 2.0)
+    if not math.isfinite(pm):
+        pm = -1.2
+    if not math.isfinite(ps) or ps <= 1e-6:
+        ps = 1.2
+    return smin, smax, pm, ps
+
+
 def _block_sigmas(B, smin=0.002, smax=80.0, pm=-1.2, ps=1.2):
+    smin = max(1e-9, float(smin))
+    smax = max(float(smax), smin * 2.0)
+    pm = float(pm)
+    ps = max(1e-6, float(ps))
     a, b = _cdf((math.log(smin) - pm) / ps), _cdf((math.log(smax) - pm) / ps)
-    return [float(np.exp(pm + ps * _ppf(a + (b - a) * (i / B)))) for i in range(B + 1)]
+    return [float(math.exp(pm + ps * _ppf(a + (b - a) * (i / B)))) for i in range(B + 1)]
 
 
 def _edm_pre(s):
@@ -346,7 +366,7 @@ def _dblock_router_features(state, args):
     last_seen = list(state.get("last_seen", [-1 for _ in range(B)]))
     if len(last_seen) != B:
         last_seen = [-1 for _ in range(B)]
-    bsig = list(state.get("bsig", _block_sigmas(B)))
+    bsig = list(state.get("bsig", _block_sigmas(B, *_dblock_sigma_config(args))))
     max_count = max(1, max(counts) if counts else 1)
     known = [float(x) for x in emas if x is not None and math.isfinite(float(x))]
     center = sum(known) / len(known) if known else 0.0
@@ -535,7 +555,7 @@ def _dblock_init(core, args):
         asg[-1] = list(range((B - 1) * sp, L))
         state = {"auto_search": False}
 
-    bsig = _block_sigmas(B)
+    bsig = _block_sigmas(B, *_dblock_sigma_config(args))
     schedule = getattr(args, "dblock_schedule", "loss_balanced")
     print(f"[dblock] DiffusionBlocks mode: {L} layers -> {B} blocks {asg}")
     print(f"[dblock] schedule={schedule} sigma boundaries: {[round(x, 3) for x in bsig]}")
@@ -568,7 +588,7 @@ def _choose_block(state, args):
                     print(f"[dblock] Dynamically adjusting block configuration from hot_config: B={state['B']} -> {new_B}, assign={new_asg}", flush=True)
                     state["B"] = new_B
                     state["assign"] = new_asg
-                    state["bsig"] = _block_sigmas(new_B)
+                    state["bsig"] = _block_sigmas(new_B, *_dblock_sigma_config(args))
                     state["counts"] = [0] * new_B
                     state["loss_ema"] = [None] * new_B
                     state["last_seen"] = [-1] * new_B
@@ -612,7 +632,7 @@ def _choose_block(state, args):
                 B, asg, cand_name = state["candidates"][state["candidate_idx"]]
                 state["B"] = B
                 state["assign"] = asg
-                state["bsig"] = _block_sigmas(B)
+                state["bsig"] = _block_sigmas(B, *_dblock_sigma_config(args))
                 state["counts"] = [0] * B
                 state["loss_ema"] = [None] * B
                 state["last_seen"] = [-1] * B
@@ -634,7 +654,7 @@ def _choose_block(state, args):
                 asg = best_cand["assign"]
                 state["B"] = B
                 state["assign"] = asg
-                state["bsig"] = _block_sigmas(B)
+                state["bsig"] = _block_sigmas(B, *_dblock_sigma_config(args))
                 state["auto_search"] = False
                 print(f"[dblock] Search complete. Locked in best candidate {best_cand['name']} (Utility={best_utility:.2f}, Loss={best_cand['loss']:.4f}, Speed={best_cand['tokps']:.1f} tok/s): {B} blocks {asg}", flush=True)
     B = state["B"]
@@ -701,6 +721,26 @@ def _sample_sigma(ids, lo, hi, args, state):
     if curriculum > 0:
         frac = min(1.0, max(0.05, (cur_step + 1) / float(curriculum)))
         hi = lo * ((hi / max(lo, 1e-8)) ** frac)
+    mode = str(getattr(args, "dblock_sigma_sampling", "lognormal") or "lognormal").lower()
+    if mode in ("lognormal", "truncated_lognormal", "edm"):
+        smin, smax, pm, ps = _dblock_sigma_config(args)
+        lo_eff = max(min(float(lo), float(hi)), smin)
+        hi_eff = min(max(float(lo), float(hi)), smax)
+        if hi_eff <= lo_eff:
+            hi_eff = min(smax, lo_eff * 1.0001)
+        qa = _cdf((math.log(lo_eff) - pm) / ps)
+        qb = _cdf((math.log(hi_eff) - pm) / ps)
+        if qb <= qa:
+            qb = min(1.0 - 1e-7, qa + 1e-7)
+        n = int(ids.size(0))
+        if bool(getattr(args, "dblock_sigma_stratified", True)) and n > 1:
+            u = (torch.arange(n, device=ids.device, dtype=torch.float32) + torch.rand((), device=ids.device)) / float(n)
+            u = u.index_select(0, torch.randperm(n, device=ids.device))
+        else:
+            u = torch.rand((n,), device=ids.device, dtype=torch.float32)
+        q = (qa + (qb - qa) * u).clamp(1e-7, 1.0 - 1e-7)
+        z = torch.erfinv(2.0 * q - 1.0) * math.sqrt(2.0)
+        return torch.exp(torch.tensor(pm, device=ids.device, dtype=torch.float32) + float(ps) * z)
     sig_np = np.exp(
         np.random.uniform(
             math.log(max(lo, 1e-4)),
@@ -5476,7 +5516,7 @@ def _dblock_euler_hidden(core, ids, args):
     import numpy as _np
     dblock_blocks = int(getattr(args, "dblock_blocks", 4) or 4)
     steps = max(dblock_blocks, int(getattr(args, "euler_steps", 0) or (dblock_blocks * 2)))
-    bsig = _block_sigmas(dblock_blocks)
+    bsig = _block_sigmas(dblock_blocks, *_dblock_sigma_config(args))
     groups = _dblock_block_layers(core, dblock_blocks)
     sigma_min = float(bsig[0])
     start = float(getattr(args, "euler_start_sigma", 0.0) or 0.0)
@@ -6188,6 +6228,7 @@ def _agillm43_profile_config(profile):
 
 
 def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", warmstart_from=None):
+    import os
     import sys
     from pathlib import Path
     script = str(Path(__file__).resolve())
@@ -6199,10 +6240,11 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         sys.executable, "-u", script, "train",
         "--preset", "agillm4_floor", "--tie_kv", "--resume_delta", resume_delta,
         *(["--warmstart_from", str(warmstart_from)] if warmstart_from else []),
-        "--dblock", "--dblock_blocks", "4", "--dblock_schedule", "loss_balanced",
+        "--dblock", "--dblock_blocks", str(os.environ.get("AGILLM43_DBLOCK_BLOCKS", "14")), "--dblock_schedule", "loss_balanced",
         "--dblock_router", "heuristic", "--dblock_router_blend", "0.35", "--dblock_router_ramp_steps", "256",
         "--dblock_warmup_steps", "16", "--dblock_sigma_curriculum_steps", "2000",
-        "--dblock_log_every", "25", "--dblock_objective_mode", "stochastic",
+        "--dblock_log_every", "25", "--dblock_sigma_sampling", "lognormal", "--dblock_sigma_stratified",
+        "--dblock_objective_mode", "stochastic",
         "--dblock_ar_prob", prof["ar_prob"], "--dblock_sat_prob", prof["sat_prob"], "--dblock_nat_prob", prof["nat_prob"],
         "--dblock_ar_loss_tokens", prof["ar_loss_tokens"], "--dblock_sat_loss_tokens", prof["sat_loss_tokens"], "--dblock_nat_loss_tokens", prof["nat_loss_tokens"],
         "--moe_ffn", "--moe_experts", "2", "--moe_top_k", "1", "--moe_mlp_mult", "4",
@@ -6553,6 +6595,20 @@ def main():
                     help="Minimum CUDA tensor size in MB to offload under --dblock_activation_offload.")
     tr.add_argument("--dblock_sigma_curriculum_steps", type=int, default=2000,
                     help="Warm sigma ranges from easy to full span over this many DBlock steps; 0 disables.")
+    tr.add_argument("--dblock_sigma_sampling", choices=["lognormal", "truncated_lognormal", "edm", "log_uniform"], default="lognormal",
+                    help="Sample sigma inside each block interval from the DBT log-normal prior; log_uniform preserves the legacy sampler.")
+    tr.add_argument("--dblock_sigma_stratified", dest="dblock_sigma_stratified", action="store_true", default=True,
+                    help="Use randomized quantile strata inside each DBlock sigma interval to reduce batch-level noise.")
+    tr.add_argument("--no-dblock_sigma_stratified", dest="dblock_sigma_stratified", action="store_false",
+                    help="Disable randomized quantile-stratified DBlock sigma sampling.")
+    tr.add_argument("--dblock_sigma_min", type=float, default=0.002,
+                    help="Minimum sigma for DiffusionBlocks log-normal block boundaries.")
+    tr.add_argument("--dblock_sigma_max", type=float, default=80.0,
+                    help="Maximum sigma for DiffusionBlocks log-normal block boundaries.")
+    tr.add_argument("--dblock_sigma_pmean", type=float, default=-1.2,
+                    help="Log-normal mean used for DiffusionBlocks sigma boundaries and sampling.")
+    tr.add_argument("--dblock_sigma_pstd", type=float, default=1.2,
+                    help="Log-normal stddev used for DiffusionBlocks sigma boundaries and sampling.")
     tr.add_argument("--dblock_edm_wmax", type=float, default=5.0,
                     help="Cap for EDM loss weighting in DBlock mode.")
     tr.add_argument("--dblock_ar_weight", type=float, default=1.0)

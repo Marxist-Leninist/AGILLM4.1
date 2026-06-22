@@ -2118,7 +2118,11 @@ from transformers import AutoTokenizer, logging as hf_log
 # from tqdm.auto import tqdm  # DISABLED - kills Claude context
 
 # ─────────────────────────────── HOT DATASET LOADING ───────────────────────────────
-HOT_CONFIG_PATH = Path("/workspace/hot_config.json")
+HOT_CONFIG_PATH = Path(os.environ.get("AGILLM_HOT_CONFIG") or os.environ.get("AGILLM_HOT_CONFIG_PATH") or "/workspace/hot_config.json")
+DEFAULT_LANGUAGE_PRETRAIN_SOURCES = os.environ.get(
+    "AGILLM_DEFAULT_LANGUAGE_PRETRAIN_SOURCES",
+    "HuggingFaceFW/fineweb,wikimedia/wikipedia:20231101.en,allenai/c4:en,EleutherAI/proof-pile-2",
+)
 _hot_config_cache = {"mtime": 0, "data": {}}
 
 def get_hot_config() -> dict:
@@ -2135,16 +2139,138 @@ def get_hot_config() -> dict:
         print(f"[hot_config] Error loading: {e}")
         return {}
 
+def _dataset_config_to_csv(value) -> str:
+    if isinstance(value, list):
+        return ",".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
+def _dataset_specs_csv(value: str) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _dataset_spec_without_weight(spec: str) -> str:
+    head, sep, tail = str(spec or "").strip().rpartition("|")
+    if sep:
+        try:
+            float(tail)
+            return head.strip()
+        except Exception:
+            pass
+    return str(spec or "").strip()
+
+
+def _dataset_merge_csv(*groups: str) -> str:
+    """Merge dataset CSV groups; later duplicate specs update weight/config but never remove defaults."""
+    ordered = []
+    by_key = {}
+    for group in groups:
+        for spec in _dataset_specs_csv(group):
+            key = _dataset_spec_without_weight(spec)
+            if not key:
+                continue
+            if key not in by_key:
+                ordered.append(key)
+            by_key[key] = spec
+    return ",".join(by_key[key] for key in ordered if key in by_key)
+
+
+def _looks_like_numeracy_source(spec: str) -> bool:
+    base = _dataset_spec_without_weight(spec).lower()
+    return "agillm_math_numeracy" in base or "math_numeracy_synth" in base
+
+
+def _looks_numeracy_only_sources(sources: str) -> bool:
+    specs = _dataset_specs_csv(sources)
+    return bool(specs) and all(_looks_like_numeracy_source(spec) for spec in specs)
+
+
+def _language_pretrain_fallback_sources() -> str:
+    return str(
+        os.environ.get("AGILLM_LANGUAGE_PRETRAIN_SOURCES")
+        or globals().get("DEFAULT_LANGUAGE_PRETRAIN_SOURCES", "")
+        or globals().get("DEFAULT_PRETRAIN_SOURCES", "")
+    ).strip()
+
+
+def _augment_numeracy_only_sources(default_sources: str) -> str:
+    default_sources = str(default_sources or "").strip()
+    disabled = str(os.environ.get("AGILLM_DISABLE_LANGUAGE_FALLBACK", "")).strip().lower() in {"1", "true", "yes", "on"}
+    if disabled or not _looks_numeracy_only_sources(default_sources):
+        return default_sources
+    language_sources = _language_pretrain_fallback_sources()
+    if not language_sources:
+        return default_sources
+    try:
+        numeracy_weight = float(os.environ.get("AGILLM_NUMERACY_FALLBACK_WEIGHT", "0.20") or 0.20)
+    except Exception:
+        numeracy_weight = 0.20
+    numeracy_weight = max(0.0, min(numeracy_weight, 1.0))
+    numeracy_specs = []
+    for spec in _dataset_specs_csv(default_sources):
+        base = _dataset_spec_without_weight(spec)
+        numeracy_specs.append(f"{base}|{numeracy_weight:g}")
+    merged = _dataset_merge_csv(language_sources, ",".join(numeracy_specs))
+    print(
+        f"[dataset-policy] numeracy-only source expanded with built-in language pretrain mix; "
+        f"numeracy_weight={numeracy_weight:g}",
+        flush=True,
+    )
+    return merged
+
+
 def get_hot_datasets(default_sources: str) -> str:
-    """Get datasets from hot_config if present, else use default"""
+    """Merge hot_config datasets into the safe default mix instead of replacing it."""
     cfg = get_hot_config()
-    if "datasets" in cfg and cfg["datasets"]:
-        hot_ds = cfg["datasets"]
-        if isinstance(hot_ds, list):
-            hot_ds = ",".join(hot_ds)
-        print(f"[hot_config] Using hot datasets: {hot_ds}")
-        return hot_ds
-    return default_sources
+    sources = _augment_numeracy_only_sources(default_sources)
+    hot_ds = _dataset_config_to_csv(cfg.get("datasets"))
+    if hot_ds:
+        sources = _dataset_merge_csv(sources, hot_ds)
+        print(f"[hot_config] Merged datasets into default mix: {hot_ds}", flush=True)
+    append_ds = _dataset_config_to_csv(cfg.get("datasets_append") or cfg.get("extra_datasets"))
+    if append_ds:
+        sources = _dataset_merge_csv(sources, append_ds)
+        print(f"[hot_config] Appended datasets: {append_ds}", flush=True)
+    return sources
+
+
+def _dataset_source_summary(sources: str) -> dict:
+    specs = _dataset_specs_csv(sources)
+    return {
+        "count": len(specs),
+        "specs": specs,
+        "has_language_mix": any(("fineweb" in s.lower()) or ("wikipedia" in s.lower()) or ("c4" in s.lower()) or ("proof-pile" in s.lower()) or ("txt360" in s.lower()) for s in specs),
+        "has_numeracy": any(_looks_like_numeracy_source(s) for s in specs),
+    }
+
+
+def _dataset_provenance(phase_name: str, requested_source: str, effective_source: str, args, *, use_hot_config: bool = True, val_requested: str = "", val_effective: str = "") -> dict:
+    cfg = get_hot_config() if use_hot_config else {}
+    hot_mtime = None
+    try:
+        hot_mtime = HOT_CONFIG_PATH.stat().st_mtime if HOT_CONFIG_PATH.exists() else None
+    except Exception:
+        hot_mtime = None
+    summary = _dataset_source_summary(effective_source)
+    return {
+        "schema": "agillm.dataset_provenance.v1",
+        "phase": str(phase_name),
+        "source_requested": str(requested_source or ""),
+        "source_effective": str(effective_source or ""),
+        "source_count": int(summary["count"]),
+        "source_specs": list(summary["specs"]),
+        "has_language_mix": bool(summary["has_language_mix"]),
+        "has_numeracy": bool(summary["has_numeracy"]),
+        "hot_config_path": str(HOT_CONFIG_PATH),
+        "hot_config_mtime": hot_mtime,
+        "hot_config_used": bool(use_hot_config),
+        "hot_config_has_datasets": bool(cfg.get("datasets")),
+        "hot_config_has_append": bool(cfg.get("datasets_append") or cfg.get("extra_datasets")),
+        "val_source_requested": str(val_requested or ""),
+        "val_source_effective": str(val_effective or ""),
+        "dataset_field_text": str(getattr(args, "dataset_field_text", "text")),
+        "chat": bool(getattr(args, "chat", False)),
+    }
 
 
 # DISABLED: # Auto-rotating log to prevent context-window suicide
@@ -5217,7 +5343,11 @@ def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, c
     info = _agillm43_save_pt(state, tmp, codec=ckpt_codec, zstd_level=1)
     tmp.replace(path)
     _write_tokenizer_sidecar(path, {k: state.get(k) for k in ("tokenizer_payload_schema", "tokenizer_id", "tokenizer_json", "tokenizer_bundle", "tokenizer_special", "transformers_version", "tokenizers_version") if state.get(k) is not None})
-    (path.parent / "latest.json").write_text(json.dumps({"path": str(path), "step": meta["step"]}))
+    latest_payload = {"path": str(path), "step": meta["step"]}
+    if meta.get("dataset_provenance"):
+        latest_payload["dataset_provenance"] = meta.get("dataset_provenance")
+        latest_payload["source_effective"] = meta.get("dataset_provenance", {}).get("source_effective", "")
+    (path.parent / "latest.json").write_text(json.dumps(latest_payload))
     if info.get("codec") == "zstd":
         print(f"\n✓ saved checkpoint {path.name} codec=zstd ratio={info.get('ratio', 0.0):.2f}x")
     else:
@@ -5945,15 +6075,30 @@ def _train_phase(
         # deterministic for a given checkpoint, different across restarts.
         data_seed = 42 + int(start_step)
         print(f"[data] per-restart shuffle seed {data_seed} (derived from resume step)", flush=True)
-    val_batches = _build_val_set(source, chat_cfg, args, BLOCK)
+    effective_source = get_hot_datasets(source)
+    val_requested = str(getattr(args, "val_source", "") or "").strip()
+    val_effective = val_requested or effective_source
+    dataset_meta = _dataset_provenance(
+        phase_name, source, effective_source, args,
+        use_hot_config=True,
+        val_requested=val_requested,
+        val_effective=val_effective,
+    )
+    print(
+        f"[dataset-policy] phase={phase_name} sources={dataset_meta['source_count']} "
+        f"language_mix={dataset_meta['has_language_mix']} numeracy={dataset_meta['has_numeracy']}",
+        flush=True,
+    )
+    val_batches = _build_val_set(effective_source, chat_cfg, args, BLOCK)
     last_val_mono = time.monotonic()
     stream = token_stream(
-        source, total_tokens_needed, seed=data_seed,
+        effective_source, total_tokens_needed, seed=data_seed,
         chat=chat_cfg.get("chat", False),
         chat_messages_key=chat_cfg.get("key", "messages"),
         sft_add_generation_prompt=chat_cfg.get("gen_prompt", False),
         dataset_field_text=chat_cfg.get("text_field", "text"),
-        streaming=streaming
+        streaming=streaming,
+        use_hot_config=False,
     )
     ce_tok = nn.CrossEntropyLoss(label_smoothing=0.1)
     ce_gate = nn.CrossEntropyLoss()
@@ -6227,6 +6372,7 @@ def _train_phase(
                     "structured_masks": bool(use_structured_masks(args)),
                     "device": str(DEV),
                     "save_dir": str(args.save_dir),
+                    "dataset_provenance": dataset_meta,
                     "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
                 if DEV.type == "cuda":
@@ -6281,8 +6427,9 @@ def _train_phase(
             _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-flush-save")
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
             save_ckpt(pathlib.Path(args.save_dir) / _ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
-                      meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights},
+                      meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights, "dataset_provenance": dataset_meta},
                       codec=getattr(args, "ckpt_codec", "zstd3"))
+            _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
             last_save_mono = time.monotonic()
             _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
             last_delta_step = step
@@ -6295,8 +6442,9 @@ def _train_phase(
                 _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-save")
                 _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
                 save_ckpt(pathlib.Path(args.save_dir) / ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
-                          meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights},
+                          meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights, "dataset_provenance": dataset_meta},
                           codec=getattr(args, "ckpt_codec", "zstd3"))
+                _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
                 last_save_mono = now_mono
                 # Prune old deltas after a full save (they're superseded)
                 _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
@@ -6327,7 +6475,7 @@ def _train_phase(
     _flush_delta()  # ensure any in-flight delta completes before final save
     if phase_name != "sft":
         save_ckpt(pathlib.Path(args.save_dir) / f"{phase_name}_final.pt", core, ar_h, sat_h, nat_h, opt, scaler,
-                  meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights},
+                  meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights, "dataset_provenance": dataset_meta},
                   codec=getattr(args, "ckpt_codec", "zstd3"))
     else:
         print("[sft] Skipping duplicate sft_final.pt; final.pt will contain the SFT result.")
@@ -6514,8 +6662,10 @@ def train(args):
             tie_weights=tie_weights,
             streaming=True
         )
+    final_effective_source = get_hot_datasets(args.source)
+    final_dataset_meta = _dataset_provenance("final", args.source, final_effective_source, args)
     save_ckpt(pathlib.Path(args.save_dir) / "final.pt", core, ar_h, sat_h, nat_h, opt, scaler,
-              meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights},
+              meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights, "dataset_provenance": final_dataset_meta},
               codec=getattr(args, "ckpt_codec", "zstd3"))
     print("🎉 All Training Complete")
 

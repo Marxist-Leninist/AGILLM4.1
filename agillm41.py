@@ -276,24 +276,18 @@ def _dblock_sigma_config(args=None):
     smax = float(getattr(args, "dblock_sigma_max", 80.0) if args is not None else 80.0)
     pm = float(getattr(args, "dblock_sigma_pmean", -1.2) if args is not None else -1.2)
     ps = float(getattr(args, "dblock_sigma_pstd", 1.2) if args is not None else 1.2)
-    if not math.isfinite(smin) or smin <= 0:
-        smin = 0.002
-    if not math.isfinite(smax) or smax <= smin:
-        smax = max(80.0, smin * 2.0)
-    if not math.isfinite(pm):
-        pm = -1.2
-    if not math.isfinite(ps) or ps <= 1e-6:
-        ps = 1.2
+    smin = max(smin, 1e-6)
+    smax = max(smax, smin * 1.0001)
+    ps = max(ps, 1e-6)
     return smin, smax, pm, ps
 
 
 def _block_sigmas(B, smin=0.002, smax=80.0, pm=-1.2, ps=1.2):
-    smin = max(1e-9, float(smin))
-    smax = max(float(smax), smin * 2.0)
-    pm = float(pm)
-    ps = max(1e-6, float(ps))
+    smin = max(float(smin), 1e-6)
+    smax = max(float(smax), smin * 1.0001)
+    ps = max(float(ps), 1e-6)
     a, b = _cdf((math.log(smin) - pm) / ps), _cdf((math.log(smax) - pm) / ps)
-    return [float(math.exp(pm + ps * _ppf(a + (b - a) * (i / B)))) for i in range(B + 1)]
+    return [float(np.exp(pm + ps * _ppf(a + (b - a) * (i / B)))) for i in range(B + 1)]
 
 
 def _edm_pre(s):
@@ -305,23 +299,88 @@ def _edm_w(s, wmax=5.0):
     return float(((s**2 + SD**2) / (s * SD) ** 2).clamp(max=wmax).mean())
 
 
+_DBLOCK_ROUTER_EVENT_FEATURES = 10
+_DBLOCK_ROUTER_HISTORY = 32
+
+
 class _DblockLearnedRouter(nn.Module):
-    def __init__(self, feature_dim=10, hidden=32, heads=4, layers=1):
+    # Transformer DBlock router conditioned on the network's running representation
+    # plus a bounded route/outcome memory. Sequence = [CTX] + B block tokens + H
+    # recent outcome tokens, so routing can learn from what the model is seeing now
+    # and what the previous routing choices actually did to loss.
+    def __init__(self, ctx_dim, d_model=64, heads=4, layers=2, feat_dim=6, n_blocks_max=64, history=_DBLOCK_ROUTER_HISTORY, event_dim=_DBLOCK_ROUTER_EVENT_FEATURES):
         super().__init__()
-        hidden = max(8, int(hidden))
+        d_model = max(16, int(d_model))
         heads = max(1, int(heads))
-        if hidden % heads != 0:
+        if d_model % heads != 0:
             heads = 1
-        self.in_proj = nn.Linear(feature_dim, hidden)
+        self.ctx_dim = int(ctx_dim)
+        self.feat_dim = int(feat_dim)
+        self.history = max(0, int(history))
+        self.event_dim = int(event_dim)
+        self.block_emb = nn.Embedding(int(n_blocks_max), d_model)
+        self.feat_proj = nn.Linear(int(feat_dim), d_model)
+        self.ctx_proj = nn.Linear(int(ctx_dim), d_model)
+        self.event_proj = nn.Linear(self.event_dim, d_model)
+        self.kind_emb = nn.Embedding(3, d_model)
+        self.event_pos = nn.Embedding(max(1, self.history), d_model)
+        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
         enc = nn.TransformerEncoderLayer(
-            d_model=hidden, nhead=heads, dim_feedforward=max(16, hidden * 2),
-            dropout=0.0, activation="gelu", batch_first=True,
+            d_model=d_model, nhead=heads, dim_feedforward=max(32, d_model * 4),
+            dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc, num_layers=max(1, int(layers)))
-        self.out = nn.Linear(hidden, 1)
+        self.ln = nn.LayerNorm(d_model)
+        self.value = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+        nn.init.normal_(self.cls, std=0.02)
 
-    def forward(self, x):
-        return self.out(self.encoder(self.in_proj(x))).squeeze(-1)
+    @staticmethod
+    def _fit_last_dim(x, dim):
+        if x.size(-1) == dim:
+            return x
+        if x.size(-1) > dim:
+            return x[..., :dim]
+        return F.pad(x, (0, dim - x.size(-1)))
+
+    def forward(self, block_ids, feats, ctx, history=None):
+        feats = self._fit_last_dim(feats.float(), self.feat_dim)
+        ctx = self._fit_last_dim(ctx.float(), self.ctx_dim)
+        B = feats.size(1)
+        bt = self.block_emb(block_ids.clamp(min=0, max=self.block_emb.num_embeddings - 1)) + self.feat_proj(feats)
+        bt = bt + self.kind_emb(torch.ones(B, dtype=torch.long, device=feats.device)).unsqueeze(0)
+        ctx_tok = self.cls + self.ctx_proj(ctx).unsqueeze(1)
+        ctx_tok = ctx_tok + self.kind_emb(torch.zeros(1, dtype=torch.long, device=feats.device)).view(1, 1, -1)
+        tokens = [ctx_tok, bt]
+        if history is not None and self.history > 0:
+            if not torch.is_tensor(history):
+                history = torch.tensor(history, dtype=feats.dtype, device=feats.device)
+            else:
+                history = history.to(device=feats.device, dtype=feats.dtype)
+            if history.dim() == 2:
+                history = history.unsqueeze(0)
+            if history.dim() == 3 and history.numel() > 0:
+                if history.size(0) == 1 and feats.size(0) > 1:
+                    history = history.expand(feats.size(0), -1, -1)
+                elif history.size(0) != feats.size(0):
+                    history = history[:1].expand(feats.size(0), -1, -1)
+                if history.size(1) > self.history:
+                    history = history[:, -self.history :, :]
+                history = self._fit_last_dim(history, self.event_dim)
+                H = history.size(1)
+                if H > 0:
+                    pos = torch.arange(H, dtype=torch.long, device=feats.device).clamp(max=max(0, self.history - 1))
+                    kind = torch.full((H,), 2, dtype=torch.long, device=feats.device)
+                    ht = self.event_proj(history) + self.event_pos(pos).unsqueeze(0) + self.kind_emb(kind).unsqueeze(0)
+                    tokens.append(ht)
+        h = self.ln(self.encoder(torch.cat(tokens, dim=1)))
+        ctx_h = h[:, 0:1, :].expand(-1, B, -1)
+        block_h = h[:, 1 : 1 + B, :]
+        return self.value(torch.cat([block_h, ctx_h], dim=-1)).squeeze(-1)
 
 
 def _dblock_router_mode(args):
@@ -332,22 +391,27 @@ def _dblock_router_enabled(args):
     return _dblock_router_mode(args) in {"transformer", "learned", "neural"}
 
 
-def _dblock_router_boot(state, args):
+def _dblock_router_boot(state, args, ctx_dim=None):
     if not _dblock_router_enabled(args):
         return
-    hidden = int(getattr(args, "dblock_router_hidden", 32) or 32)
+    hidden = int(getattr(args, "dblock_router_hidden", 64) or 64)
     heads = int(getattr(args, "dblock_router_heads", 4) or 4)
-    layers = int(getattr(args, "dblock_router_layers", 1) or 1)
+    layers = int(getattr(args, "dblock_router_layers", 2) or 2)
     lr = float(getattr(args, "dblock_router_lr", 0.002) or 0.002)
-    router = _DblockLearnedRouter(10, hidden, heads, layers).to("cpu")
+    history = max(8, min(128, int(getattr(args, "dblock_router_history", _DBLOCK_ROUTER_HISTORY) or _DBLOCK_ROUTER_HISTORY)))
+    cdim = int(ctx_dim or state.get("router_ctx_dim", 0) or 64)
+    state["router_ctx_dim"] = cdim
+    router = _DblockLearnedRouter(ctx_dim=cdim, d_model=hidden, heads=heads, layers=layers, history=history).to("cpu")
     state["router"] = router
     state["router_opt"] = torch.optim.AdamW(router.parameters(), lr=lr, weight_decay=1e-3)
     state["router_target_ema"] = None
     state["router_target_abs_ema"] = None
     state["router_train_loss"] = None
     state["router_last"] = None
+    state["router_history"] = []
+    state["router_history_limit"] = history
     print(
-        f"[dblock] learned_router=transformer hidden={hidden} heads={heads} layers={layers} lr={lr:g} "
+        f"[dblock] learned_router=ctx_seq_transformer hidden={hidden} heads={heads} layers={layers} ctx_dim={cdim} history={history} lr={lr:g} "
         f"blend={float(getattr(args, 'dblock_router_blend', 0.35)):.2f} "
         f"ramp_steps={int(getattr(args, 'dblock_router_ramp_steps', 256) or 0)}",
         flush=True,
@@ -378,7 +442,6 @@ def _dblock_router_features(state, args):
     logs = [math.log(max(1e-9, float(x))) for x in bsig]
     log_min = min(logs) if logs else 0.0
     log_span = max(1e-6, (max(logs) - log_min) if logs else 1.0)
-    step_norm = min(1.0, math.log1p(max(0, step)) / math.log1p(10000.0))
     feats = []
     for i in range(B):
         ema = emas[i]
@@ -386,14 +449,115 @@ def _dblock_router_features(state, args):
         loss_z = 0.0 if not known_flag else max(-5.0, min(5.0, (float(ema) - center) / scale))
         lo = logs[min(i, len(logs) - 1)] if logs else 0.0
         hi = logs[min(i + 1, len(logs) - 1)] if logs else lo
+        sig_mid = ((0.5 * (lo + hi)) - log_min) / log_span
         feats.append([
             loss_z, known_flag, float(counts[i]) / float(max_count),
             max(0.0, float(max_count - counts[i]) / float(max_count)),
-            min(1.0, max(0.0, float(stale[i]) / stale_denom)),
-            float(i) / float(max(1, B - 1)), (lo - log_min) / log_span,
-            (hi - log_min) / log_span, step_norm, 1.0,
+            min(1.0, max(0.0, float(stale[i]) / stale_denom)), float(sig_mid),
         ])
-    return torch.tensor([feats], dtype=torch.float32)
+    block_ids = torch.arange(B, dtype=torch.long).unsqueeze(0)
+    ft = torch.tensor([feats], dtype=torch.float32)
+    cdim = int(state.get("router_ctx_dim", 0) or 0)
+    ctx = state.get("router_ctx")
+    if torch.is_tensor(ctx) and cdim > 0 and ctx.numel() == cdim:
+        cv = ctx.detach().reshape(1, cdim).float()
+    else:
+        cv = torch.zeros(1, max(1, cdim))
+    return block_ids, ft, cv
+
+
+def _dblock_router_clip(x, lo=-5.0, hi=5.0):
+    try:
+        x = float(x)
+    except Exception:
+        return 0.0
+    if not math.isfinite(x):
+        return 0.0
+    return max(lo, min(hi, x))
+
+
+def _dblock_router_history_features(state, args):
+    limit = int(state.get("router_history_limit", getattr(args, "dblock_router_history", _DBLOCK_ROUTER_HISTORY)) or 0)
+    limit = max(0, min(128, limit))
+    if limit <= 0:
+        return torch.zeros((1, 0, _DBLOCK_ROUTER_EVENT_FEATURES), dtype=torch.float32)
+    hist = list(state.get("router_history", []))[-limit:]
+    if not hist:
+        return torch.zeros((1, 0, _DBLOCK_ROUTER_EVENT_FEATURES), dtype=torch.float32)
+    B = int(state["B"])
+    step = int(state.get("step", 0))
+    losses = []
+    for rec in hist:
+        try:
+            loss = float(rec.get("loss", 0.0))
+        except Exception:
+            loss = 0.0
+        if math.isfinite(loss):
+            losses.append(loss)
+    center = sum(losses) / len(losses) if losses else 0.0
+    scale = (sum((x - center) ** 2 for x in losses) / len(losses)) ** 0.5 if len(losses) > 1 else max(1.0, abs(center) * 0.05)
+    scale = max(1e-3, scale)
+    rows = []
+    for rec in hist:
+        rec_step = int(rec.get("step", -1))
+        block = max(0, min(B - 1, int(rec.get("block", 0))))
+        age = max(0, step - rec_step)
+        try:
+            rec_loss = float(rec.get("loss", center))
+        except Exception:
+            rec_loss = center
+        loss = _dblock_router_clip((rec_loss - center) / scale)
+        rows.append([
+            float(block) / float(max(1, B - 1)),
+            _dblock_router_clip(rec.get("target", 0.0)),
+            loss,
+            max(0.0, min(1.0, float(rec.get("count_norm", 0.0)))),
+            max(0.0, min(1.0, float(rec.get("stale_norm", 0.0)))),
+            min(1.0, math.log1p(age) / math.log1p(max(2, limit))),
+            min(1.0, math.log1p(max(0, rec_step)) / math.log1p(10000.0)),
+            1.0 if float(rec.get("router_choice", 0.0)) > 0.0 else 0.0,
+            max(0.0, min(1.0, float(rec.get("blend", 0.0)))),
+            1.0,
+        ])
+    return torch.tensor([rows], dtype=torch.float32)
+
+
+def _dblock_router_append_history(state, args, bi, loss_float, target_val):
+    limit = int(state.get("router_history_limit", getattr(args, "dblock_router_history", _DBLOCK_ROUTER_HISTORY)) or _DBLOCK_ROUTER_HISTORY)
+    limit = max(0, min(128, limit))
+    if limit <= 0:
+        return
+    B = int(state["B"])
+    step = int(state.get("step", 0))
+    counts = list(state.get("counts", [0 for _ in range(B)]))
+    if len(counts) != B:
+        counts = [0 for _ in range(B)]
+    last_seen = list(state.get("last_seen", [-1 for _ in range(B)]))
+    if len(last_seen) != B:
+        last_seen = [-1 for _ in range(B)]
+    max_count = max(1, max(counts) if counts else 1)
+    stale = step - last_seen[int(bi)] if 0 <= int(bi) < len(last_seen) and last_seen[int(bi)] >= 0 else step + 1
+    max_stale = int(getattr(args, "dblock_max_stale_steps", 64) or 0)
+    stale_denom = float(max(1, max_stale if max_stale > 0 else stale))
+    route = state.get("router_last")
+    router_choice = 0.0
+    blend = 0.0
+    if isinstance(route, dict):
+        router_choice = 1.0 if int(route.get("choice", -1)) == int(bi) else 0.0
+        blend = float(route.get("blend", 0.0))
+    hist = state.setdefault("router_history", [])
+    hist.append({
+        "step": int(step),
+        "block": int(bi),
+        "loss": float(loss_float),
+        "target": float(target_val),
+        "count_norm": float(counts[int(bi)]) / float(max_count) if 0 <= int(bi) < len(counts) else 0.0,
+        "stale_norm": min(1.0, max(0.0, float(stale) / stale_denom)),
+        "router_choice": router_choice,
+        "blend": blend,
+    })
+    if len(hist) > limit:
+        del hist[:-limit]
 
 
 def _dblock_router_norm(xs):
@@ -403,6 +567,75 @@ def _dblock_router_norm(xs):
     mean = sum(vals) / len(vals)
     scale = max(1e-6, (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5)
     return [(x - mean) / scale for x in vals]
+
+
+def _dblock_fleet_lane_keys(args):
+    keys = []
+    for env_key in ("AGILLM_FLEET_LANE", "AGILLM_WORKER_ID", "AGILLM_LANE_ID"):
+        val = os.environ.get(env_key, "")
+        if val:
+            keys.append(str(val))
+    save_dir = str(getattr(args, "save_dir", "") or "")
+    if save_dir:
+        keys.append(os.path.basename(save_dir.rstrip("/")))
+        keys.append(save_dir)
+    return [k for i, k in enumerate(keys) if k and k not in keys[:i]]
+
+
+def _dblock_fleet_router_scores(state, args, base_scores):
+    state["fleet_router_last"] = None
+    if not base_scores:
+        return None
+    try:
+        cfg = get_hot_config()
+    except Exception:
+        return None
+    spec = cfg.get("dblock_fleet_router") or cfg.get("dblock_fleet_route")
+    if not isinstance(spec, dict):
+        return None
+    if str(spec.get("enabled", True)).lower() in {"0", "false", "off", "no"}:
+        return None
+    lanes = spec.get("lanes") if isinstance(spec.get("lanes"), dict) else {}
+    lane_key = None
+    lane = None
+    for key in _dblock_fleet_lane_keys(args):
+        cand = lanes.get(key)
+        if isinstance(cand, dict):
+            lane_key, lane = key, cand
+            break
+    if lane is None:
+        return None
+    bias = lane.get("bias", lane.get("block_bias", lane.get("biases")))
+    if not isinstance(bias, (list, tuple)):
+        return None
+    B = int(state.get("B", len(base_scores)) or len(base_scores))
+    if len(bias) != B or len(base_scores) != B:
+        return None
+    vals = []
+    for x in bias:
+        try:
+            fx = float(x)
+        except Exception:
+            fx = 0.0
+        vals.append(0.0 if not math.isfinite(fx) else max(-3.0, min(3.0, fx)))
+    if not any(abs(x) > 1e-9 for x in vals):
+        return None
+    strength = float(lane.get("strength", spec.get("strength", 0.20)) or 0.0)
+    strength = max(0.0, min(1.0, strength))
+    if strength <= 1e-9:
+        return None
+    base = [float(x) if math.isfinite(float(x)) else 0.0 for x in base_scores]
+    mean = sum(base) / len(base)
+    scale = max(1e-3, (sum((x - mean) ** 2 for x in base) / len(base)) ** 0.5)
+    adjusted = [base[i] + strength * scale * vals[i] for i in range(B)]
+    state["fleet_router_last"] = {
+        "lane": str(lane_key),
+        "role": str(lane.get("role", "")),
+        "strength": float(strength),
+        "bias": [float(x) for x in vals],
+        "updated_at": spec.get("updated_at", ""),
+    }
+    return adjusted
 
 
 def _dblock_router_choose(state, args, heuristic_scores):
@@ -423,9 +656,10 @@ def _dblock_router_choose(state, args, heuristic_scores):
     blend = blend_base * ramp
     if blend <= 1e-6:
         return None
+    history_features = _dblock_router_history_features(state, args)
     with torch.no_grad():
         router.eval()
-        pred = router(_dblock_router_features(state, args))[0].detach().cpu().tolist()
+        pred = router(*_dblock_router_features(state, args), history=history_features)[0].detach().cpu().tolist()
     h = _dblock_router_norm(heuristic_scores)
     q = _dblock_router_norm(pred)
     if len(h) != B or len(q) != B:
@@ -433,7 +667,13 @@ def _dblock_router_choose(state, args, heuristic_scores):
     counts = state.get("counts", [0 for _ in range(B)])
     combined = [(1.0 - blend) * h[i] + blend * q[i] for i in range(B)]
     choice = max(range(B), key=lambda i: (combined[i], -counts[i], -i))
-    state["router_last"] = {"mode": "transformer", "choice": int(choice), "blend": float(blend), "pred": [float(x) for x in pred]}
+    state["router_last"] = {
+        "mode": "ctx_seq_transformer",
+        "choice": int(choice),
+        "blend": float(blend),
+        "history": int(history_features.size(1)),
+        "pred": [float(x) for x in pred],
+    }
     return choice
 
 
@@ -457,7 +697,7 @@ def _dblock_router_update(state, args, bi, loss_value):
         scale = max(1.0, abs(loss_float) * 0.05)
     target_val = max(-5.0, min(5.0, (loss_float - float(baseline)) / max(1e-3, float(scale))))
     router.train()
-    pred = router(_dblock_router_features(state, args))[0, int(bi)]
+    pred = router(*_dblock_router_features(state, args), history=_dblock_router_history_features(state, args))[0, int(bi)]
     fit_loss = F.smooth_l1_loss(pred, pred.detach().new_tensor(target_val))
     opt.zero_grad(set_to_none=True)
     fit_loss.backward()
@@ -467,6 +707,7 @@ def _dblock_router_update(state, args, bi, loss_value):
     state["router_target_ema"] = 0.98 * float(baseline) + 0.02 * loss_float
     state["router_target_abs_ema"] = 0.98 * float(scale) + 0.02 * max(1e-3, diff)
     state["router_train_loss"] = float(fit_loss.detach().cpu())
+    _dblock_router_append_history(state, args, bi, loss_float, target_val)
 
 
 def _dblock_get_candidates(L):
@@ -569,7 +810,7 @@ def _dblock_init(core, args):
         "loss_ema": [None for _ in range(B)],
         "last_seen": [-1 for _ in range(B)],
     })
-    _dblock_router_boot(state, args)
+    _dblock_router_boot(state, args, ctx_dim=int(getattr(core.emb, "embedding_dim", 0)) or None)
     return state
 
 
@@ -670,6 +911,7 @@ def _choose_block(state, args):
     if len(last_seen) != B:
         last_seen[:] = [-1 for _ in range(B)]
     state["router_last"] = None
+    state["fleet_router_last"] = None
     if schedule == "random":
         return random.randrange(B)
     if schedule == "roundrobin":
@@ -709,9 +951,13 @@ def _choose_block(state, args):
         undertrain_score = undertrain_bonus * max(0.0, (max_count - counts[i]) / count_denom)
         return (loss_score + stale_score + undertrain_score, -counts[i], stale[i], -i)
 
-    heuristic_scores = [float(score(i)[0]) for i in range(B)]
-    heuristic_choice = max(range(B), key=score)
-    learned_choice = _dblock_router_choose(state, args, heuristic_scores)
+    base_scores = [float(score(i)[0]) for i in range(B)]
+    route_scores = _dblock_fleet_router_scores(state, args, base_scores) or base_scores
+    if route_scores is base_scores:
+        heuristic_choice = max(range(B), key=score)
+    else:
+        heuristic_choice = max(range(B), key=lambda i: (route_scores[i], -counts[i], stale[i], -i))
+    learned_choice = _dblock_router_choose(state, args, route_scores)
     return heuristic_choice if learned_choice is None else learned_choice
 
 
@@ -722,23 +968,22 @@ def _sample_sigma(ids, lo, hi, args, state):
         frac = min(1.0, max(0.05, (cur_step + 1) / float(curriculum)))
         hi = lo * ((hi / max(lo, 1e-8)) ** frac)
     mode = str(getattr(args, "dblock_sigma_sampling", "lognormal") or "lognormal").lower()
-    if mode in ("lognormal", "truncated_lognormal", "edm"):
-        smin, smax, pm, ps = _dblock_sigma_config(args)
-        lo_eff = max(min(float(lo), float(hi)), smin)
-        hi_eff = min(max(float(lo), float(hi)), smax)
-        if hi_eff <= lo_eff:
-            hi_eff = min(smax, lo_eff * 1.0001)
-        qa = _cdf((math.log(lo_eff) - pm) / ps)
-        qb = _cdf((math.log(hi_eff) - pm) / ps)
-        if qb <= qa:
-            qb = min(1.0 - 1e-7, qa + 1e-7)
+    if mode in {"lognormal", "truncated_lognormal", "edm"}:
+        _, _, pm, ps = _dblock_sigma_config(args)
+        qa = _cdf((math.log(max(lo, 1e-6)) - pm) / ps)
+        qb = _cdf((math.log(max(hi, lo * 1.0001)) - pm) / ps)
+        qa = min(max(qa, 1e-7), 1.0 - 1e-7)
+        qb = min(max(qb, qa + 1e-7), 1.0 - 1e-7)
         n = int(ids.size(0))
         if bool(getattr(args, "dblock_sigma_stratified", True)) and n > 1:
+            # Beyond the DBT paper: randomized quantile strata reduce Monte Carlo
+            # variance of the conditional p_noise integral for each block.
             u = (torch.arange(n, device=ids.device, dtype=torch.float32) + torch.rand((), device=ids.device)) / float(n)
             u = u.index_select(0, torch.randperm(n, device=ids.device))
         else:
-            u = torch.rand((n,), device=ids.device, dtype=torch.float32)
-        q = (qa + (qb - qa) * u).clamp(1e-7, 1.0 - 1e-7)
+            u = torch.rand(n, device=ids.device, dtype=torch.float32)
+        q = qa + (qb - qa) * u
+        q = q.clamp(1e-7, 1.0 - 1e-7)
         z = torch.erfinv(2.0 * q - 1.0) * math.sqrt(2.0)
         return torch.exp(torch.tensor(pm, device=ids.device, dtype=torch.float32) + float(ps) * z)
     sig_np = np.exp(
@@ -788,10 +1033,24 @@ def _maybe_log(
     route = state.get("router_last")
     if isinstance(route, dict):
         pred = ",".join(f"{float(x):.2f}" for x in route.get("pred", []))
-        raw_part += f" router={route.get('mode', 'none')} blend={float(route.get('blend', 0.0)):.2f} pred=[{pred}]"
+        hist = route.get("history")
+        hist_part = "" if hist is None else f" hist={int(hist)}"
+        raw_part += f" router={route.get('mode', 'none')} blend={float(route.get('blend', 0.0)):.2f}{hist_part} pred=[{pred}]"
     rloss = state.get("router_train_loss")
     if rloss is not None:
         raw_part += f" router_fit={float(rloss):.3f}"
+    fleet = state.get("fleet_router_last")
+    if isinstance(fleet, dict):
+        fbias = fleet.get("bias", [])
+        top = []
+        try:
+            top = sorted(range(len(fbias)), key=lambda j: abs(float(fbias[j])), reverse=True)[:3]
+        except Exception:
+            top = []
+        top_part = ",".join(f"{j}:{float(fbias[j]):+.2f}" for j in top)
+        raw_part += f" fleet={fleet.get('lane', '')} role={fleet.get('role', '')} strength={float(fleet.get('strength', 0.0)):.2f}"
+        if top_part:
+            raw_part += f" fleet_bias=[{top_part}]"
     print(
         f"[dblock] step={step} block={bi} obj={objective or 'mixed'} layers={layers} "
         f"loss={display:.3f} weighted={total_val:.3f} ar={ar_val:.3f} sat={sat_val:.3f} nat={nat_val:.3f}"
@@ -838,13 +1097,43 @@ def _activation_offload_hooks(args):
     return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
 
 
-def _run_block(block, x, mask, use_checkpoint, args=None):
+def _dblock_sublayer_base_mode(args):
+    mode = str(getattr(args, "dblock_sublayer_mode", "off") or "off").strip().lower().replace("-", "_")
+    if mode in {"none", "disabled"}:
+        return "off"
+    return mode
+
+
+def _dblock_sublayer_mode_for_layer(args, state, block_idx, layer_pos):
+    mode = _dblock_sublayer_base_mode(args)
+    if mode == "split_alt":
+        step = int((state or {}).get("step", 0))
+        return "attn_only" if ((step + int(block_idx) + int(layer_pos)) % 2 == 0) else "ffn_only"
+    if mode == "cycle":
+        step = int((state or {}).get("step", 0))
+        return ("full", "ffn_only", "attn_only")[(step + int(block_idx) + int(layer_pos)) % 3]
+    return mode
+
+
+def _run_block_forward(block, x, mask, sublayer_mode="off"):
+    mode = str(sublayer_mode or "off").strip().lower().replace("-", "_")
+    if mode in {"off", "full"}:
+        return block(x, mask)
+    if mode == "attn_only":
+        n = x.size(1)
+        return x + block.mha(block.ln1(x), mask, rel_bias_tokens=n)
+    if mode == "ffn_only":
+        return x + block.ff(block.ln2(x))
+    raise ValueError(f"unknown DBlock sublayer mode: {sublayer_mode}")
+
+
+def _run_block(block, x, mask, use_checkpoint, args=None, sublayer_mode="off"):
     if use_checkpoint:
-        return _ck.checkpoint(lambda y, block=block: block(y, mask), x, use_reentrant=False)
+        return _ck.checkpoint(lambda y, block=block, mode=sublayer_mode: _run_block_forward(block, y, mask, mode), x, use_reentrant=False)
     if args is not None and _activation_offload_enabled(args):
         with _activation_offload_hooks(args):
-            return block(x, mask)
-    return block(x, mask)
+            return _run_block_forward(block, x, mask, sublayer_mode)
+    return _run_block_forward(block, x, mask, sublayer_mode)
 
 
 def _dblock_checkpoint_this_layer(args, base_enabled, layer_pos, layer_count=None):
@@ -921,6 +1210,11 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     bs = state["bsig"]
     T = ids.size(1)
     use_layer_checkpoint = bool(getattr(args, "grad_checkpoint", False))
+    if _dblock_router_enabled(args):
+        with torch.no_grad():
+            _rc_emb = core.emb(ids)
+            state["router_ctx"] = _rc_emb.mean(dim=(0, 1)).detach().float().to("cpu")
+            del _rc_emb
     bi = _choose_block(state, args)
     lo, hi = sorted([bs[bi], bs[bi + 1]])
     layers = asg[bi]
@@ -963,7 +1257,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             zt = emb + sig[:, None, None] * torch.randn_like(emb)
             h = ci * zt
             for lpos, li in enumerate(layers):
-                h = _run_block(core.blocks[li], h, causal, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args)
+                mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
+                h = _run_block(core.blocks[li], h, causal, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
             Dn = core.ln(cs * zt + co * h)
         _profile_toc(state, "ar_forward", _t)
         _t = _profile_tic(prof)
@@ -991,7 +1286,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
             h2 = ci * zt2
             for lpos, li in enumerate(layers):
-                h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args)
+                mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
+                h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
             Ds = core.ln(cs * zt2 + co * h2)
         _profile_toc(state, "sat_forward", _t)
         _t = _profile_tic(prof)
@@ -1032,6 +1328,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
 
     if run_nat:
         ratio = min(max(float(getattr(args, "nat_mask_ratio", 0.5)), 0.05), 0.95)
+        nat_mode = str(getattr(args, "dblock_nat_embed_noise_mode", "off") or "off").strip().lower()
+        nat_noise_scale = max(0.0, float(getattr(args, "dblock_nat_embed_noise_scale", 1.0) or 1.0))
         nat_ids = M._nat_ids_for_training(ids, int(getattr(args, "nat_max_tokens", 0)))
         _t = _profile_tic(prof)
         with M.amp(args.amp):
@@ -1039,10 +1337,22 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             m = torch.rand(nat_ids.shape, device=nat_ids.device) < ratio
             if not bool(m.any()):
                 m[..., -1] = True
-            nat_in[m] = M.BLANK
-            hn = core.emb(nat_in)
+            if nat_mode in {"visible", "mask_plus_noise"}:
+                clean_hn = core.emb(nat_ids)
+                if nat_mode == "mask_plus_noise":
+                    nat_in[m] = M.BLANK
+                    hn = core.emb(nat_in)
+                else:
+                    hn = clean_hn.clone()
+                nat_noise = sig[:, None, None].to(clean_hn.dtype) * nat_noise_scale * torch.randn_like(clean_hn)
+                hn = hn.clone()
+                hn[m] = (clean_hn + nat_noise)[m]
+            else:
+                nat_in[m] = M.BLANK
+                hn = core.emb(nat_in)
             for lpos, li in enumerate(layers):
-                hn = _run_block(core.blocks[li], hn, None, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args)
+                mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
+                hn = _run_block(core.blocks[li], hn, None, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
             Dnat = core.ln(hn)
         _profile_toc(state, "nat_forward", _t)
         _t = _profile_tic(prof)
@@ -1081,6 +1391,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     _spike_k = float(getattr(args, "loss_spike_skip", 0.0))
     if _spike_k > 0.0:
         _ema = state.get("spike_ema")
+        if _ema is not None and _ema <= 0.0: _ema = None; state.pop("spike_ema", None)  # reset degenerate zero-EMA
         if _ema is not None and math.isfinite(_ema) and math.isfinite(raw_avg_val) and raw_avg_val > _spike_k * _ema:
             opt.zero_grad(set_to_none=True)
             if torch.cuda.is_available():
@@ -1090,7 +1401,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             _profile_step_done(state, args)
             _update_stats(state, bi, total_val, args)
             return total_val
-        if math.isfinite(raw_avg_val):
+        if math.isfinite(raw_avg_val) and raw_avg_val > 1e-3:  # skip near-zero
             state["spike_ema"] = raw_avg_val if _ema is None else (0.98 * _ema + 0.02 * raw_avg_val)
 
     _t = _profile_tic(prof)
@@ -1919,6 +2230,164 @@ else:
 # Some DeepSeek tokenizer releases use Ġ (U+0120) for space-prefixed tokens,
 # but some transformers versions set the Metaspace pre-tokenizer to use
 # ▁ (U+2581) instead, causing encode/decode to lose all spaces.
+def _set_backend_tokenizer(tokenizer, backend) -> None:
+    """Swap a fast tokenizer backing tokenizers.Tokenizer across transformers versions.
+    Modern transformers expose backend_tokenizer as a READ-ONLY property backed by
+    _tokenizer; older versions allow direct assignment. Setting _tokenizer is what makes
+    the checkpoint tokenizer-restore actually take effect (it was failing silently)."""
+    try:
+        tokenizer._tokenizer = backend
+        return
+    except Exception:
+        pass
+    tokenizer.backend_tokenizer = backend
+
+
+def _tokenizer_payload() -> dict:
+    """Embed enough tokenizer state for checkpoints/deltas to be self-contained.
+
+    tokenizer_json is the exact fast-tokenizer backend. tokenizer_bundle stores the
+    small save_pretrained() files as text for environments that need config/special
+    token metadata too. This is intentionally best-effort so a tokenizer hiccup never
+    aborts a model save.
+    """
+    out = {"tokenizer_payload_schema": 2}
+    try:
+        out["tokenizer_id"] = TOKENIZER_ID
+    except Exception:
+        pass
+    try:
+        out["tokenizer_json"] = tok.backend_tokenizer.to_str()
+    except Exception as e:
+        print(f"[tokenizer] WARNING: could not embed tokenizer_json in checkpoint: {e}")
+    try:
+        out["tokenizer_special"] = {
+            "pad_token": getattr(tok, "pad_token", None),
+            "pad_token_id": getattr(tok, "pad_token_id", None),
+            "eos_token": getattr(tok, "eos_token", None),
+            "eos_token_id": getattr(tok, "eos_token_id", None),
+            "sep_token": getattr(tok, "sep_token", None),
+            "sep_token_id": getattr(tok, "sep_token_id", None),
+            "vocab_size": len(tok.get_vocab()) if hasattr(tok, "get_vocab") else None,
+        }
+    except Exception:
+        pass
+    try:
+        import tempfile
+        bundle = {}
+        with tempfile.TemporaryDirectory(prefix="agillm_tok_") as td:
+            tok.save_pretrained(td)
+            for item in Path(td).iterdir():
+                if item.is_file() and item.stat().st_size <= 64 * 1024 * 1024:
+                    try:
+                        bundle[item.name] = item.read_text(encoding="utf-8")
+                    except UnicodeDecodeError:
+                        import base64
+                        bundle[item.name] = {"base64": base64.b64encode(item.read_bytes()).decode("ascii")}
+        if bundle:
+            out["tokenizer_bundle"] = bundle
+    except Exception as e:
+        print(f"[tokenizer] WARNING: could not embed tokenizer bundle in checkpoint: {e}")
+    return out
+
+
+def _tokenizer_sidecar_paths(path):
+    try:
+        p = Path(path)
+    except Exception:
+        return []
+    return [
+        Path(str(p) + ".tokenizer.json"),
+        p.with_suffix(p.suffix + ".tokenizer.json"),
+        p.parent / (p.name + ".tokenizer.json"),
+    ]
+
+
+def _read_tokenizer_sidecar(path):
+    import json as _json
+    if not path:
+        return {}
+    for sidecar in _tokenizer_sidecar_paths(path):
+        try:
+            if sidecar.exists():
+                obj = _json.loads(sidecar.read_text(encoding="utf-8"))
+                if isinstance(obj, dict):
+                    obj.setdefault("tokenizer_sidecar", str(sidecar))
+                    return obj
+        except Exception as exc:
+            print(f"[tokenizer] WARNING: could not read tokenizer sidecar {sidecar}: {exc}")
+    return {}
+
+
+def _write_tokenizer_sidecar(path, payload) -> None:
+    """Write tokenizer metadata beside a full checkpoint and as latest.tokenizer.json."""
+    try:
+        p = Path(path)
+        data = dict(payload or {})
+        if data.get("tokenizer_json") and not data.get("tokenizer_payload_schema"):
+            data["tokenizer_payload_schema"] = 2
+        data.setdefault("tokenizer_payload_schema", 2)
+        data["checkpoint_name"] = p.name
+        data["checkpoint_path"] = str(p)
+        for out in (Path(str(p) + ".tokenizer.json"), p.parent / "latest.tokenizer.json"):
+            tmp = Path(str(out) + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            tmp.replace(out)
+    except Exception as exc:
+        print(f"[tokenizer] WARNING: could not write tokenizer sidecar for {path}: {exc}")
+
+
+def _apply_tokenizer_special(payload) -> None:
+    try:
+        spec = payload.get("tokenizer_special") if hasattr(payload, "get") else None
+        if not isinstance(spec, dict):
+            return
+        if spec.get("pad_token") is not None:
+            tok.pad_token = spec.get("pad_token")
+        if spec.get("eos_token") is not None:
+            tok.eos_token = spec.get("eos_token")
+        if spec.get("sep_token") is not None:
+            tok.sep_token = spec.get("sep_token")
+    except Exception as exc:
+        print(f"[tokenizer] WARNING: special-token restore skipped: {exc}")
+
+
+def _restore_tokenizer_from_ckpt(d, ckpt_path=None) -> None:
+    """Make tok match what a checkpoint/delta was trained with.
+
+    Embedded tokenizer_json is exact and preferred. A sidecar produced for older
+    checkpoints is next. Runtime TOKENIZER_ID is last-resort compatibility only.
+    Never raises: a tokenizer issue must not abort load/infer.
+    """
+    try:
+        payload = d if hasattr(d, "get") else {}
+        if ckpt_path:
+            sidecar = _read_tokenizer_sidecar(ckpt_path)
+            if sidecar:
+                merged = dict(sidecar)
+                # Embedded checkpoint fields win, but sidecars can fill schema,
+                # special-token metadata, or bundle files missing from old saves.
+                merged.update({k: v for k, v in payload.items() if str(k).startswith("tokenizer_") and v is not None})
+                payload = merged
+        tj = payload.get("tokenizer_json") if hasattr(payload, "get") else None
+        if tj:
+            from tokenizers import Tokenizer as _Tokenizer
+            _set_backend_tokenizer(tok, _Tokenizer.from_str(tj))
+            _apply_tokenizer_special(payload)
+            source = payload.get("tokenizer_sidecar") or "checkpoint"
+            print(f"[tokenizer] Restored from {source}")
+            return
+        tid = payload.get("tokenizer_id") if hasattr(payload, "get") else None
+        if tid and tid != TOKENIZER_ID:
+            print(f"[tokenizer] WARNING: checkpoint trained with tokenizer_id={tid} but runtime TOKENIZER_ID={TOKENIZER_ID}; set TOKENIZER_ID to match")
+        elif tid:
+            print(f"[tokenizer] checkpoint tokenizer_id={tid} matches runtime (no embedded json)")
+        else:
+            print("[tokenizer] no tokenizer embedded in checkpoint; using runtime default")
+    except Exception as e:
+        print(f"[tokenizer] WARNING: tokenizer restore skipped: {e}")
+
+
 def _fix_tokenizer_space_mismatch(tokenizer):
     try:
         import json as _json
@@ -1944,7 +2413,7 @@ def _fix_tokenizer_space_mismatch(tokenizer):
                     pat["String"] = "\u0120"
         # Rebuild backend tokenizer
         fixed = _Tokenizer.from_str(_json.dumps(tj))
-        tokenizer.backend_tokenizer = fixed
+        _set_backend_tokenizer(tokenizer, fixed)
         # Verify fix
         test_ids = tokenizer.encode("hello world")
         test_dec = tokenizer.decode(test_ids, skip_special_tokens=True)
@@ -2127,7 +2596,7 @@ def _resolve_ckpt(path: pathlib.Path) -> pathlib.Path | None:
 
 def _try_load(path: pathlib.Path, map_location="cpu"):
     try:
-        return torch.load(path, map_location="cpu")
+        return _agillm43_load_pt(path, map_location=map_location, weights_only=False)
     except Exception as e:
         print(f"[ckpt-skip] {path} not usable: {e}")
         return None
@@ -2297,9 +2766,9 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         ds_names = get_hot_datasets(ds_names)  # HOT LOAD
     raw = [s.strip() for s in ds_names.split(",") if s.strip()]
     if not raw: return
-    # Weighted interleave across sources, with an online single-layer reliability
-    # router on top. Base weights express policy; the router learns which sources
-    # are actually yielding clean text quickly in this run and across restarts.
+    # Weighted interleave across sources, with an online quality router on top.
+    # Base weights express policy; the router learns which sources yield bounded,
+    # clean, useful examples instead of rewarding giant records for token volume.
     sources, weights = [], []
     for s in raw:
         w = 1.0
@@ -2312,6 +2781,11 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         sources.append(s); weights.append(max(w, 0.0))
     if sum(weights) <= 0:
         weights = [1.0] * len(sources)
+    try:
+        max_example_tokens = int(os.environ.get("AGILLM_MAX_EXAMPLE_TOKENS", "4096") or 0)
+    except Exception:
+        max_example_tokens = 4096
+    max_example_tokens = max(0, max_example_tokens)
     _rng = random.Random(seed)
     its = [None] * len(sources)
     emitted = 0
@@ -2331,6 +2805,8 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
     router_sharpness = max(1.0, min(float(os.environ.get("AGILLM_DATASET_ROUTER_SHARPNESS", "3.0") or 3.0), 8.0))
     router_log_sec = max(30.0, float(os.environ.get("AGILLM_DATASET_ROUTER_LOG_SEC", "300") or 300))
     router_save_sec = max(10.0, float(os.environ.get("AGILLM_DATASET_ROUTER_SAVE_SEC", "60") or 60))
+    router_target_tokens = max(64.0, float(os.environ.get("AGILLM_DATASET_ROUTER_TARGET_TOKENS", str(max(512, min(max_example_tokens or 4096, 2048)))) or 2048))
+    router_min_quality = max(0.0, min(1.0, float(os.environ.get("AGILLM_DATASET_ROUTER_MIN_QUALITY", "0.45") or 0.45)))
     router_last_log = 0.0
     router_last_save = 0.0
 
@@ -2369,10 +2845,11 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         return 1.0 / (1.0 + math.exp(-x))
 
     def _load_router_state():
+        default_weights = [-0.15, 0.85, 1.40, -2.00, -0.25, 0.90, -2.50, 2.40, -3.00, -2.80, -1.60, -0.80]
         default = {
-            "schema": "agillm.dataset_router.v1",
+            "schema": "agillm.dataset_router.v2",
             "updated_utc": "",
-            "weights": [-0.25, 0.55, 2.20, -2.80, -0.85, 1.10, -1.70],
+            "weights": list(default_weights),
             "sources": {},
             "agent": {},
         }
@@ -2383,8 +2860,11 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                     default.update({k: loaded.get(k, default[k]) for k in default})
                     if not isinstance(default.get("sources"), dict):
                         default["sources"] = {}
-                    if not isinstance(default.get("weights"), list) or len(default["weights"]) != 7:
-                        default["weights"] = [-0.25, 0.55, 2.20, -2.80, -0.85, 1.10, -1.70]
+                    if default.get("schema") != "agillm.dataset_router.v2":
+                        default["schema"] = "agillm.dataset_router.v2"
+                        default["weights"] = list(default_weights)
+                    if not isinstance(default.get("weights"), list) or len(default["weights"]) != len(default_weights):
+                        default["weights"] = list(default_weights)
         except Exception as exc:
             print(f"[dataset-router] warning: could not load {router_state_path}: {exc}", flush=True)
         return default
@@ -2402,6 +2882,12 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         st.setdefault("err_ema", 0.05)
         st.setdefault("lat_ema", 1.0)
         st.setdefault("tok_ema", 256.0)
+        st.setdefault("token_fit_ema", 0.50)
+        st.setdefault("quality_ema", 0.65)
+        st.setdefault("replacement_ema", 0.0)
+        st.setdefault("control_ema", 0.0)
+        st.setdefault("repeat_ema", 0.0)
+        st.setdefault("short_ema", 0.05)
         st.setdefault("empty_ema", 0.05)
         st.setdefault("pulls", 0)
         st.setdefault("tokens", 0)
@@ -2410,6 +2896,7 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         st.setdefault("last_ok", 0.0)
         st.setdefault("last_error", "")
         st.setdefault("last_score", 0.5)
+        st.setdefault("last_quality", 0.65)
         st.setdefault("agent_score_mult", 1.0)
         st.setdefault("agent_penalty_until", 0.0)
         st.setdefault("agent_last_check", 0.0)
@@ -2431,8 +2918,13 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             float(st.get("ok_ema", 0.55)),
             float(st.get("err_ema", 0.05)),
             min(1.0, float(st.get("lat_ema", 1.0)) / 15.0),
-            min(1.0, float(st.get("tok_ema", 256.0)) / 4096.0),
+            float(st.get("token_fit_ema", 0.50)),
             float(st.get("empty_ema", 0.05)),
+            float(st.get("quality_ema", 0.65)),
+            float(st.get("replacement_ema", 0.0)),
+            float(st.get("control_ema", 0.0)),
+            float(st.get("repeat_ema", 0.0)),
+            float(st.get("short_ema", 0.05)),
         ]
 
     def _router_score(i, now):
@@ -2632,6 +3124,11 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                 "empty_ema": float(st.get("empty_ema", 0.0)),
                 "lat_ema": float(st.get("lat_ema", 0.0)),
                 "tok_ema": float(st.get("tok_ema", 0.0)),
+                "token_fit_ema": float(st.get("token_fit_ema", 0.0)),
+                "quality_ema": float(st.get("quality_ema", 0.0)),
+                "replacement_ema": float(st.get("replacement_ema", 0.0)),
+                "control_ema": float(st.get("control_ema", 0.0)),
+                "repeat_ema": float(st.get("repeat_ema", 0.0)),
                 "router_score": float(st.get("last_score", 0.5)),
                 "disabled_for_sec": max(0.0, float(disabled_until[i]) - now),
                 "agent_score_mult": float(st.get("agent_score_mult", 1.0) or 1.0),
@@ -2697,18 +3194,74 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             flush=True,
         )
 
-    def _router_update(i, label, feat, token_count=0, latency=0.0, err="", empty=False):
+    def _score_text_sample(text, token_count):
+        preview = str(text or "")[:65536]
+        n = max(1, len(preview))
+        repl = preview.count("\ufffd") / n
+        control = sum(1 for ch in preview if ord(ch) < 32 and ch not in "\n\r\t") / n
+        long_runs = 0
+        run = 1
+        prev = ""
+        for ch in preview:
+            if ch == prev:
+                run += 1
+            else:
+                if run >= 12:
+                    long_runs += run
+                prev = ch
+                run = 1
+        if run >= 12:
+            long_runs += run
+        repeat = long_runs / n
+        whitespace = sum(1 for ch in preview if ch.isspace()) / n
+        alpha = sum(1 for ch in preview if ch.isalpha()) / n
+        digit = sum(1 for ch in preview if ch.isdigit()) / n
+        tok = max(0.0, float(token_count or 0.0))
+        token_fit = max(0.0, min(1.0, 1.0 - abs(tok - router_target_tokens) / max(router_target_tokens, 1.0)))
+        short = 1.0 if tok < min(128.0, router_target_tokens * 0.25) else 0.0
+        quality = 1.0
+        quality -= min(0.55, repl * 18.0)
+        quality -= min(0.40, control * 28.0)
+        quality -= min(0.35, repeat * 7.0)
+        if whitespace < 0.04 or whitespace > 0.55:
+            quality -= 0.12
+        if alpha < 0.18 and digit > 0.35:
+            quality -= 0.16
+        if tok < 32:
+            quality -= 0.35
+        elif tok < 128:
+            quality -= 0.12
+        quality = max(0.0, min(1.0, quality))
+        return quality, token_fit, repl, control, repeat, short
+
+    def _router_update(i, label, feat, token_count=0, latency=0.0, err="", empty=False, quality=None, token_fit=None, replacement_rate=0.0, control_rate=0.0, repeat_rate=0.0, short=0.0):
         if i is None:
             return
         st = _source_state(sources[i])
-        label = 1.0 if label else 0.0
+        try:
+            label = max(0.0, min(1.0, float(label)))
+        except Exception:
+            label = 0.0
         alpha = 0.04
+        q = float(st.get("quality_ema", 0.65) if quality is None else max(0.0, min(1.0, float(quality))))
+        fit = float(st.get("token_fit_ema", 0.50) if token_fit is None else max(0.0, min(1.0, float(token_fit))))
+        replacement_rate = max(0.0, min(1.0, float(replacement_rate or 0.0)))
+        control_rate = max(0.0, min(1.0, float(control_rate or 0.0)))
+        repeat_rate = max(0.0, min(1.0, float(repeat_rate or 0.0)))
+        short = max(0.0, min(1.0, float(short or 0.0)))
         st["pulls"] = int(st.get("pulls", 0)) + 1
         st["ok_ema"] = (1.0 - alpha) * float(st.get("ok_ema", 0.55)) + alpha * label
         st["err_ema"] = (1.0 - alpha) * float(st.get("err_ema", 0.05)) + alpha * (1.0 - label)
         st["lat_ema"] = (1.0 - alpha) * float(st.get("lat_ema", 1.0)) + alpha * max(float(latency or 0.0), 0.0)
         st["tok_ema"] = (1.0 - alpha) * float(st.get("tok_ema", 256.0)) + alpha * max(float(token_count or 0.0), 0.0)
+        st["token_fit_ema"] = (1.0 - alpha) * float(st.get("token_fit_ema", 0.50)) + alpha * fit
+        st["quality_ema"] = (1.0 - alpha) * float(st.get("quality_ema", 0.65)) + alpha * q
+        st["replacement_ema"] = (1.0 - alpha) * float(st.get("replacement_ema", 0.0)) + alpha * replacement_rate
+        st["control_ema"] = (1.0 - alpha) * float(st.get("control_ema", 0.0)) + alpha * control_rate
+        st["repeat_ema"] = (1.0 - alpha) * float(st.get("repeat_ema", 0.0)) + alpha * repeat_rate
+        st["short_ema"] = (1.0 - alpha) * float(st.get("short_ema", 0.05)) + alpha * short
         st["empty_ema"] = (1.0 - alpha) * float(st.get("empty_ema", 0.05)) + alpha * (1.0 if empty else 0.0)
+        st["last_quality"] = q
         if label >= 0.5:
             st["tokens"] = int(st.get("tokens", 0)) + int(token_count or 0)
             st["last_ok"] = time.time()
@@ -2764,7 +3317,7 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                 rows.append((float(st.get("last_score", _router_score(i, now))), i, st))
             rows.sort(reverse=True)
             msg = "; ".join(
-                f"{i}:{sources[i][:36]} score={score:.2f} ok={st.get('ok_ema', 0):.2f} err={st.get('err_ema', 0):.2f} tok={st.get('tok_ema', 0):.0f}"
+                f"{i}:{sources[i][:36]} score={score:.2f} q={st.get('quality_ema', 0):.2f} fit={st.get('token_fit_ema', 0):.2f} ok={st.get('ok_ema', 0):.2f} err={st.get('err_ema', 0):.2f} tok={st.get('tok_ema', 0):.0f}"
                 for score, i, st in rows[:5]
             )
             print(f"[dataset-router] {msg}", flush=True)
@@ -2793,14 +3346,25 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                 print(f"[stream-recover] {sources[src_idx]} recovered after {fail_counts[src_idx]} failures", flush=True)
                 fail_counts[src_idx] = 0
                 disabled_until[src_idx] = 0.0
+            max_example_chars = int(os.environ.get("AGILLM_MAX_EXAMPLE_CHARS", str(max(8192, (max_example_tokens or 4096) * 8))) or 0)
+            if max_example_chars and len(text) > max_example_chars:
+                span_chars = max(1, len(text) - max_example_chars + 1)
+                start_chars = _rng.randrange(span_chars)
+                text = text[start_chars:start_chars + max_example_chars]
             enc = tok.encode(text)
             if EOS is not None and (len(enc) == 0 or enc[-1] != EOS):
                 enc = enc + [EOS]
+            if max_example_tokens and len(enc) > max_example_tokens:
+                span = max(1, len(enc) - max_example_tokens + 1)
+                start = _rng.randrange(span)
+                enc = enc[start:start + max_example_tokens]
             if not enc:
                 _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err="empty_tokens", empty=True)
                 _agent_maybe_advise(src_idx, "empty_tokens")
                 continue
-            _router_update(src_idx, 1, feat, token_count=len(enc), latency=time.perf_counter() - t0)
+            quality, token_fit, replacement_rate, control_rate, repeat_rate, short = _score_text_sample(text, len(enc))
+            label = quality if quality >= router_min_quality else max(0.0, quality * 0.5)
+            _router_update(src_idx, label, feat, token_count=len(enc), latency=time.perf_counter() - t0, quality=quality, token_fit=token_fit, replacement_rate=replacement_rate, control_rate=control_rate, repeat_rate=repeat_rate, short=short)
             for t in enc:
                 yield t
                 emitted += 1
@@ -3683,17 +4247,411 @@ def _sha256_file(path: pathlib.Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def _do_delta_save(tensors: dict, path: pathlib.Path, meta: dict):
+
+_AGILLM43_TENSOR_CODEC_MAGIC = "__agillm43_tensor_state_codec__"
+_AGILLM43_PAYLOAD_CODEC_MAGIC = "__agillm43_payload_codec__"
+_AGILLM43_TENSOR_CODEC_VERSION = "agillm43_tensor_state_v3_rowq8c"
+
+
+def _agillm43_dtype_name(dtype) -> str:
+    return str(dtype).replace("torch.", "")
+
+
+def _agillm43_dtype_from_name(name: str):
+    return getattr(torch, str(name).replace("torch.", ""))
+
+
+def _agillm43_zstd_compress(data: bytes, level: int = 1) -> bytes:
+    try:
+        import zstandard as zstd
+        return zstd.ZstdCompressor(level=int(level)).compress(data)
+    except Exception:
+        import zlib
+        return b"ZLIB" + zlib.compress(data, max(1, min(9, int(level))))
+
+
+def _agillm43_payload_bytes(data) -> bytes:
+    if torch.is_tensor(data):
+        return data.detach().cpu().contiguous().numpy().tobytes()
+    return bytes(data)
+
+
+def _agillm43_byte_tensor(data: bytes) -> torch.Tensor:
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        return torch.frombuffer(memoryview(data), dtype=torch.uint8).clone()
+
+
+def _agillm43_zstd_decompress(data: bytes) -> bytes:
+    data = _agillm43_payload_bytes(data)
+    if data.startswith(b"ZLIB"):
+        import zlib
+        return zlib.decompress(data[4:])
+    import zstandard as zstd
+    return zstd.ZstdDecompressor().decompress(data)
+
+
+def _agillm43_tensor_bytes(t: torch.Tensor) -> bytes:
+    tc = t.detach().cpu().contiguous()
+    return tc.view(torch.uint8).numpy().tobytes()
+
+
+def _agillm43_tensor_from_bytes(raw: bytes, dtype_name: str, shape):
+    dtype = _agillm43_dtype_from_name(dtype_name)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        return torch.frombuffer(memoryview(raw), dtype=dtype).clone().reshape(tuple(int(x) for x in shape))
+
+
+def _agillm43_zstd_level_from_codec(codec: str, default: int = 1) -> int:
+    text = str(codec or "").strip().lower()
+    level = int(default or 1)
+    try:
+        import re as _re
+        m = _re.search(r"zstd(?:[-_]?level)?[-_]?([0-9]{1,2})", text)
+        if m:
+            level = int(m.group(1))
+        else:
+            env_level = os.environ.get("AGILLM43_ZSTD_LEVEL")
+            if env_level:
+                level = int(env_level)
+    except Exception:
+        level = int(default or 1)
+    return max(1, min(22, int(level)))
+
+
+def _agillm43_pack_aux_tensor(tensor: torch.Tensor, zstd_level: int = 1):
+    raw = _agillm43_tensor_bytes(tensor)
+    compressed = _agillm43_zstd_compress(raw, zstd_level)
+    if len(compressed) < len(raw):
+        return _agillm43_byte_tensor(compressed), "zstd", len(compressed)
+    return _agillm43_byte_tensor(raw), "raw", len(raw)
+
+
+def _agillm43_unpack_aux_tensor(data, codec: str, dtype_name: str, shape):
+    raw = _agillm43_zstd_decompress(data) if codec == "zstd" else _agillm43_payload_bytes(data)
+    return _agillm43_tensor_from_bytes(raw, dtype_name, shape)
+
+
+def _agillm43_encode_tensor_state(state, mode: str = "adaptive-zstd", zstd_level: int = 1):
+    """Problem-specific tensor codec for DBlock lease/update payloads.
+
+    Modes:
+    - off/raw/none: return the input unchanged.
+    - zstd/lossless-zstd: lossless per-tensor zstd bytes.
+    - fp16-zstd: cast floating tensors to fp16 before zstd.
+    - int8-zstd/q8-zstd: symmetric per-tensor int8 + zstd.
+    - rowq8-zstd/int8-rowwise-zstd: last-axis row-wise int8 + zstd,
+      optimized for AGILLM4.3 projection/embedding matrices with outlier rows.
+    - adaptive-zstd/auto: choose global int8 when it passes the AGILLM4.3
+      side-update error budget, otherwise row-wise int8 for matrix-like tensors
+      when that passes, otherwise fp16. This is the production default for
+      DBlock federation traffic because it is usually smaller and faster to
+      decompress than fp16-zstd on AGILLM4.3 block weights.
+    """
+    if not isinstance(state, dict):
+        return state
+    mode = str(mode or "off").strip().lower()
+    if mode in {"", "off", "none", "raw", "false", "0"}:
+        return state
+    if mode in {"auto", "adaptive", "agillm-auto", "agillm43-auto"}:
+        mode = "adaptive-zstd"
+    q8_rms_max = float(os.environ.get("AGILLM43_CODEC_Q8_RMS_MAX", "0.0060") or 0.0060)
+    q8_max_abs = float(os.environ.get("AGILLM43_CODEC_Q8_MAX_ABS", "0.020") or 0.020)
+    adaptive_exact = str(os.environ.get("AGILLM43_CODEC_ADAPTIVE_EXACT", "0")).lower() in {"1", "true", "yes", "on"}
+    rowq8_scale_dtype = str(os.environ.get("AGILLM43_CODEC_ROWQ8_SCALE_DTYPE", "float16") or "float16").lower()
+    tensors = {}
+    plain = {}
+    source_total = 0
+    raw_total = 0
+    packed_total = 0
+    tensor_count = 0
+    pack_counts = defaultdict(int)
+
+    def make_int8_candidate(src: torch.Tensor):
+        f = src.float()
+        maxabs = float(f.abs().max().item()) if f.numel() else 0.0
+        scale = max(maxabs / 127.0, 1.0e-12)
+        q = torch.clamp(torch.round(f / scale), -127, 127).to(torch.int8).contiguous()
+        if mode.startswith("adaptive"):
+            # Fast bound/estimate for uniform symmetric quantization. Exact scans are
+            # available for lab runs, but the federation hot path needs encode speed.
+            rms = float(scale / math.sqrt(12.0))
+            maxerr = float(scale * 0.5)
+            if adaptive_exact:
+                err = q.float().mul(scale).sub(f)
+                rms = float(err.pow(2).mean().sqrt().item()) if err.numel() else 0.0
+                maxerr = float(err.abs().max().item()) if err.numel() else 0.0
+        else:
+            rms = 0.0
+            maxerr = 0.0
+        return q, scale, rms, maxerr
+
+    def make_rowwise_int8_candidate(src: torch.Tensor):
+        rowq8_min_cols = int(os.environ.get("AGILLM43_CODEC_ROWQ8_MIN_COLS", "64") or 64)
+        if src.ndim < 2 or int(src.shape[-1]) < rowq8_min_cols or src.numel() == 0:
+            return None
+        f = src.float()
+        cols = int(f.shape[-1])
+        rows = int(f.numel() // cols)
+        flat = f.reshape(rows, cols)
+        scales = flat.abs().amax(dim=1).div(127.0).clamp_min(1.0e-12).to(torch.float32).contiguous()
+        q = torch.clamp(torch.round(flat / scales[:, None]), -127, 127).to(torch.int8).contiguous()
+        recon_scales = scales.to(torch.float16).float() if rowq8_scale_dtype not in {"fp32", "float32"} else scales
+        if mode.startswith("adaptive"):
+            # Same hot-path bound as global int8, but per row. Include the tiny
+            # fp16-scale storage error used by the production rowq8c payload.
+            # Near-threshold candidates get one exact refinement pass; that keeps
+            # adaptive from falling back to fp16 on AGILLM projection rows whose
+            # conservative bound is pessimistic but actual error is inside budget.
+            scale_err = recon_scales.sub(scales).abs()
+            rms = float(torch.sqrt(torch.mean((recon_scales / math.sqrt(12.0)).pow(2))).item())
+            if scale_err.numel():
+                rms += float(torch.sqrt(torch.mean((scale_err * 64.0).pow(2))).item())
+            maxerr = float((recon_scales.abs().max() * 0.5 + scale_err.max() * 127.0).item()) if scale_err.numel() else float((recon_scales.abs().max() * 0.5).item())
+            refine_margin = float(os.environ.get("AGILLM43_CODEC_ROWQ8_REFINE_MARGIN", "1.50") or 1.50)
+            if adaptive_exact or (rms <= q8_rms_max * refine_margin and maxerr <= q8_max_abs * refine_margin):
+                err = q.float().mul(recon_scales[:, None]).sub(flat)
+                rms = float(err.pow(2).mean().sqrt().item()) if err.numel() else 0.0
+                maxerr = float(err.abs().max().item()) if err.numel() else 0.0
+        else:
+            rms = 0.0
+            maxerr = 0.0
+        return q.reshape(tuple(src.shape)), scales, rows, cols, rms, maxerr
+
+    def pack_rowwise_scales(scales: torch.Tensor):
+        if rowq8_scale_dtype in {"fp32", "float32"}:
+            stored = scales.to(torch.float32).contiguous()
+        else:
+            stored = scales.to(torch.float16).contiguous()
+        data, codec, nbytes = _agillm43_pack_aux_tensor(stored, zstd_level)
+        return data, codec, _agillm43_dtype_name(stored.dtype), int(nbytes)
+
+    for key, value in state.items():
+        if not torch.is_tensor(value):
+            plain[key] = value
+            continue
+        src = value.detach().cpu().contiguous()
+        source_total += int(src.numel() * src.element_size())
+        orig_dtype = _agillm43_dtype_name(src.dtype)
+        pack_kind = "lossless"
+        scale = None
+        scales = None
+        scales_data = None
+        scales_codec = None
+        scales_dtype = None
+        rows = None
+        cols = None
+        scale_nbytes = 0
+        err_rms = None
+        err_max_abs = None
+        rowwise_mode = mode.startswith("rowq8") or mode.startswith("int8-row") or mode.startswith("q8-row")
+        if src.is_floating_point() and rowwise_mode:
+            rowq = make_rowwise_int8_candidate(src)
+            if rowq is None:
+                packed_tensor, scale, err_rms, err_max_abs = make_int8_candidate(src)
+                pack_kind = "int8_symmetric"
+            else:
+                packed_tensor, scales, rows, cols, err_rms, err_max_abs = rowq
+                scales = scales.to(torch.float32).contiguous()
+                scales_data, scales_codec, scales_dtype, scale_nbytes = pack_rowwise_scales(scales)
+                scales = None
+                pack_kind = "int8_rowwise"
+        elif src.is_floating_point() and (mode.startswith("int8") or mode.startswith("q8")):
+            packed_tensor, scale, err_rms, err_max_abs = make_int8_candidate(src)
+            pack_kind = "int8_symmetric"
+        elif src.is_floating_point() and mode.startswith("adaptive") and src.dtype != torch.float16:
+            q, q_scale, q_rms, q_max = make_int8_candidate(src)
+            if q_rms <= q8_rms_max and q_max <= q8_max_abs:
+                packed_tensor = q
+                scale = q_scale
+                err_rms = q_rms
+                err_max_abs = q_max
+                pack_kind = "int8_symmetric"
+            else:
+                rowq = make_rowwise_int8_candidate(src)
+                if rowq is not None:
+                    rq, rq_scales, rq_rows, rq_cols, rq_rms, rq_max = rowq
+                    if rq_rms <= q8_rms_max and rq_max <= q8_max_abs:
+                        packed_tensor = rq
+                        scales = rq_scales.to(torch.float32).contiguous()
+                        scales_data, scales_codec, scales_dtype, scale_nbytes = pack_rowwise_scales(scales)
+                        scales = None
+                        rows = rq_rows
+                        cols = rq_cols
+                        err_rms = rq_rms
+                        err_max_abs = rq_max
+                        pack_kind = "int8_rowwise"
+                    else:
+                        packed_tensor = src.to(torch.float16).contiguous()
+                        pack_kind = "fp16"
+                        err = packed_tensor.float().sub(src.float())
+                        err_rms = float(err.pow(2).mean().sqrt().item()) if err.numel() else 0.0
+                        err_max_abs = float(err.abs().max().item()) if err.numel() else 0.0
+                else:
+                    packed_tensor = src.to(torch.float16).contiguous()
+                    pack_kind = "fp16"
+                    err = packed_tensor.float().sub(src.float())
+                    err_rms = float(err.pow(2).mean().sqrt().item()) if err.numel() else 0.0
+                    err_max_abs = float(err.abs().max().item()) if err.numel() else 0.0
+        elif src.is_floating_point() and mode.startswith("fp16") and src.dtype != torch.float16:
+            packed_tensor = src.to(torch.float16).contiguous()
+            pack_kind = "fp16"
+        else:
+            packed_tensor = src
+        raw = _agillm43_tensor_bytes(packed_tensor)
+        raw_total += len(raw)
+        compressed = _agillm43_zstd_compress(raw, zstd_level)
+        if len(compressed) < len(raw):
+            data_bytes = compressed
+            codec = "zstd"
+        else:
+            data_bytes = raw
+            codec = "raw"
+        packed_total += len(data_bytes) + scale_nbytes
+        data = _agillm43_byte_tensor(data_bytes)
+        pack_counts[pack_kind] += 1
+        item = {
+            "shape": list(src.shape),
+            "orig_dtype": orig_dtype,
+            "packed_dtype": _agillm43_dtype_name(packed_tensor.dtype),
+            "pack_kind": pack_kind,
+            "scale": scale,
+            "scales": scales,
+            "scales_data": scales_data,
+            "scales_codec": scales_codec,
+            "scales_dtype": scales_dtype,
+            "rows": rows,
+            "cols": cols,
+            "scale_nbytes": scale_nbytes,
+            "codec": codec,
+            "raw_nbytes": len(raw),
+            "packed_nbytes": len(data_bytes),
+            "data": data,
+        }
+        if err_rms is not None:
+            item["err_rms"] = float(err_rms)
+        if err_max_abs is not None:
+            item["err_max_abs"] = float(err_max_abs)
+        tensors[key] = item
+        tensor_count += 1
+    return {
+        _AGILLM43_TENSOR_CODEC_MAGIC: _AGILLM43_TENSOR_CODEC_VERSION,
+        "mode": mode,
+        "zstd_level": int(zstd_level),
+        "q8_rms_max": float(q8_rms_max),
+        "q8_max_abs": float(q8_max_abs),
+        "adaptive_exact": bool(adaptive_exact),
+        "tensor_count": tensor_count,
+        "pack_counts": dict(pack_counts),
+        "source_nbytes": int(source_total),
+        "raw_nbytes": int(raw_total),
+        "packed_nbytes": int(packed_total),
+        "plain": plain,
+        "tensors": tensors,
+    }
+
+def _agillm43_decode_tensor_state(state):
+    if not (isinstance(state, dict) and str(state.get(_AGILLM43_TENSOR_CODEC_MAGIC, "")).startswith("agillm43_tensor_state_v")):
+        return state
+    out = dict(state.get("plain") or {})
+    for key, item in (state.get("tensors") or {}).items():
+        data = item.get("data", b"")
+        raw = _agillm43_zstd_decompress(data) if item.get("codec") == "zstd" else _agillm43_payload_bytes(data)
+        packed = _agillm43_tensor_from_bytes(raw, item.get("packed_dtype"), item.get("shape"))
+        if item.get("pack_kind") == "int8_symmetric":
+            scale = float(item.get("scale") or 1.0)
+            value = packed.float().mul_(scale)
+        elif item.get("pack_kind") == "int8_rowwise":
+            rows = int(item.get("rows") or 0)
+            scales_data = item.get("scales_data")
+            if scales_data is not None:
+                rows = rows or int(item.get("scale_rows") or 0)
+                scales = _agillm43_unpack_aux_tensor(scales_data, item.get("scales_codec"), item.get("scales_dtype") or "float16", [rows]).float()
+            else:
+                scales = item.get("scales")
+                if not torch.is_tensor(scales):
+                    raise ValueError(f"rowwise tensor codec missing scales for {key}")
+                scales = scales.float()
+                rows = rows or int(scales.numel())
+            value = packed.float().reshape(rows, -1).mul_(scales.reshape(rows, 1)).reshape(tuple(int(x) for x in item.get("shape")))
+        else:
+            value = packed
+        out[key] = value
+    return out
+
+
+def _agillm43_tensor_state_summary(state) -> dict:
+    if isinstance(state, dict) and str(state.get(_AGILLM43_TENSOR_CODEC_MAGIC, "")).startswith("agillm43_tensor_state_v"):
+        source = int(state.get("source_nbytes") or state.get("raw_nbytes") or 0)
+        raw = int(state.get("raw_nbytes") or 0)
+        packed = int(state.get("packed_nbytes") or 0)
+        return {
+            "codec": state.get(_AGILLM43_TENSOR_CODEC_MAGIC),
+            "mode": state.get("mode"),
+            "tensors": int(state.get("tensor_count") or 0),
+            "pack_counts": dict(state.get("pack_counts") or {}),
+            "source_nbytes": source,
+            "raw_nbytes": raw,
+            "packed_nbytes": packed,
+            "ratio": (float(source) / float(packed)) if packed > 0 else 0.0,
+            "post_transform_ratio": (float(raw) / float(packed)) if packed > 0 else 0.0,
+        }
+    return {"codec": "raw"}
+
+
+def _agillm43_save_pt(obj, path, codec: str = "off", zstd_level: int = 1):
+    codec = str(codec or "off").strip().lower()
+    zstd_level = _agillm43_zstd_level_from_codec(codec, zstd_level)
+    if codec in {"", "off", "none", "raw", "false", "0"}:
+        torch.save(obj, path, _use_new_zipfile_serialization=False)
+        return {"codec": "raw"}
+    import io
+    buf = io.BytesIO()
+    torch.save(obj, buf, _use_new_zipfile_serialization=False)
+    raw = buf.getvalue()
+    packed = _agillm43_zstd_compress(raw, zstd_level)
+    if len(packed) >= len(raw):
+        torch.save(obj, path, _use_new_zipfile_serialization=False)
+        return {"codec": "raw", "raw_nbytes": len(raw), "packed_nbytes": len(packed), "zstd_level": int(zstd_level)}
+    wrapper = {
+        _AGILLM43_PAYLOAD_CODEC_MAGIC: "agillm43_zstd_torch_v1",
+        "codec": "zstd",
+        "zstd_level": int(zstd_level),
+        "requested_codec": codec,
+        "raw_nbytes": len(raw),
+        "packed_nbytes": len(packed),
+        "payload": _agillm43_byte_tensor(packed),
+    }
+    torch.save(wrapper, path, _use_new_zipfile_serialization=False)
+    return {"codec": "zstd", "raw_nbytes": len(raw), "packed_nbytes": len(packed), "zstd_level": int(zstd_level), "ratio": float(len(raw)) / max(1.0, float(len(packed)))}
+
+
+def _agillm43_load_pt(path, map_location="cpu", weights_only=False):
+    obj = torch.load(path, map_location=map_location, weights_only=weights_only)
+    if isinstance(obj, dict) and obj.get(_AGILLM43_PAYLOAD_CODEC_MAGIC) == "agillm43_zstd_torch_v1":
+        import io
+        raw = _agillm43_zstd_decompress(obj["payload"])
+        return torch.load(io.BytesIO(raw), map_location=map_location, weights_only=weights_only)
+    return obj
+
+def _do_delta_save(tensors: dict, path: pathlib.Path, meta: dict, codec: str = "zstd"):
     """Background worker: write weight-only checkpoint + checksum."""
     try:
         path.parent.mkdir(exist_ok=True, parents=True)
         tmp = path.with_suffix(path.suffix + ".dtmp")
-        torch.save({"weights": tensors, **meta}, tmp, _use_new_zipfile_serialization=False)
+        payload = {"weights": tensors, **meta}
+        info = _agillm43_save_pt(payload, tmp, codec=codec, zstd_level=1)
         digest = _sha256_file(tmp)
         tmp.replace(path)
         # Write sidecar checksum
         path.with_suffix(".sha256").write_text(f"{digest}  {path.name}\n")
-        print(f"  [delta] saved {path.name} ({digest[:12]}...)")
+        if info.get("codec") == "zstd":
+            print(f"  [delta] saved {path.name} ({digest[:12]}...) codec=zstd ratio={info.get('ratio', 0.0):.2f}x")
+        else:
+            print(f"  [delta] saved {path.name} ({digest[:12]}...) codec=raw")
     except Exception as e:
         print(f"  [delta] FAILED {path.name}: {e}")
 
@@ -3935,7 +4893,7 @@ def _fuse_legacy_qkv_optimizer_state(opt_state: dict, opt, core, ar_h, sat_h, na
 
     return {"state": new_states, "param_groups": new_groups}
 
-def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str):
+def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str, delta_codec: str = "zstd3"):
     """Save weight-only delta in background thread. Non-blocking."""
     global _delta_thread
     # Wait for any previous delta write to finish
@@ -3950,9 +4908,9 @@ def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pat
         }
         if nat_h is not None:
             tensors["nat"] = {k: v.detach().cpu() for k, v in _checkpoint_state_dict(nat_h).items()}
-    meta = {"step": step, "seen_tok": seen_tok, "wall_time": time.time(), "delta": True}
+    meta = {"step": step, "seen_tok": seen_tok, "wall_time": time.time(), "delta": True, "agillm43_delta_codec": str(delta_codec or "off"), **_tokenizer_payload()}
     path = save_dir / f"{phase_name}_delta_step{step:08d}.pt"
-    _delta_thread = threading.Thread(target=_do_delta_save, args=(tensors, path, meta), daemon=True)
+    _delta_thread = threading.Thread(target=_do_delta_save, args=(tensors, path, meta, delta_codec), daemon=True)
     _delta_thread.start()
 
 def _prune_delta_files_to_count(save_dir: pathlib.Path, phase_name: str, keep_count: int):
@@ -4067,6 +5025,38 @@ def _disk_hygiene(save_dir, phase_name: str, args, reason: str = ""):
                 for p in d.glob("*"):
                     if not young(p, 600):
                         rm(p)
+        # 4b) V100 federation-cutover artifacts (fed14_* round/results/cache staging and
+        #     per-GPU side_updates_g*). These are named differently from the legacy
+        #     side_rounds / side_updates layout swept in section 4, so the original glob
+        #     never matched them and they accumulated (root cause of the 2026-06 disk creep).
+        #     Keep the newest round + results dir (an in-flight round is recent => young());
+        #     applied side-updates already live bounded in agillm41_side_updates/incoming.
+        try:
+            fed_round = newest_first([d for d in ws.glob("agillm_v100_fed14_round_*") if d.is_dir()])
+            fed_res   = newest_first([d for d in ws.glob("agillm_v100_fed14_results_*") if d.is_dir()])
+            for p in fed_round[1:] + fed_res[1:]:
+                if not young(p, 1800):
+                    rm(p)
+            for hb in ws.glob("agillm_v100_fed14_round_*.heartbeat.jsonl"):
+                if not young(hb, 1800):
+                    rm(hb)
+            for c in ws.glob("agillm_v100_fed14_cache"):
+                if c.is_dir() and not young(c, 1800):
+                    rm(c)
+            for gd in ws.glob("agillm41_side_updates_g*"):
+                inc_g = gd / "incoming"
+                if inc_g.exists():
+                    for p in newest_first(list(inc_g.glob("*.pt")))[4:]:
+                        if not young(p):
+                            rm(p)
+                for sub in ("accepted", "rejected"):
+                    d = gd / sub
+                    if d.exists():
+                        for p in d.glob("*"):
+                            if not young(p, 600):
+                                rm(p)
+        except Exception:
+            pass
         # 5) escalate under the free-space floor (transient + extra ckpts only)
         if floor > 0 and free_gb() < floor:
             print(f"  [disk] below floor {floor:.0f}GB (free {free_gb():.1f}GB){(' ' + reason) if reason else ''}; escalating", flush=True)
@@ -4183,7 +5173,7 @@ def load_delta(path: pathlib.Path, core, ar_h, sat_h, nat_h=None):
         if expected != actual:
             raise ValueError(f"Checksum mismatch for {path.name}: expected {expected[:12]}... got {actual[:12]}...")
         print(f"  [delta] checksum OK for {path.name}")
-    ck = torch.load(path, map_location="cpu", weights_only=False)
+    ck = _agillm43_load_pt(path, map_location="cpu", weights_only=False)
     if not ck.get("delta"):
         raise ValueError(f"{path.name} is not a delta checkpoint")
     core.load_state_dict(_prepare_core_state_dict_for_load(core, ck["weights"]["core"]))
@@ -4195,6 +5185,7 @@ def load_delta(path: pathlib.Path, core, ar_h, sat_h, nat_h=None):
             _load_module_state_compatible(nat_h, nat_sd, "nat")
         else:
             print("[nat] Delta has no NAT head; keeping fresh NAT initialization")
+    _restore_tokenizer_from_ckpt(ck, path)
     return ck.get("step", 0), ck.get("seen_tok", 0)
 
 def _flush_delta():
@@ -4204,14 +5195,16 @@ def _flush_delta():
         print("  [delta] flushing in-flight write...")
         _delta_thread.join(timeout=120)
 
-def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta):
+def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, codec: str = "zstd"):
     path.parent.mkdir(exist_ok=True, parents=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
+    tokenizer_payload = _tokenizer_payload()
+    tokenizer_payload.setdefault("tokenizer_payload_schema", 2)
     state = {
         "core": _checkpoint_state_dict(core), "ar": _checkpoint_state_dict(ar_h), "sat": _checkpoint_state_dict(sat_h),
         "opt": opt.state_dict(), "scaler": scaler.state_dict(),
-        "cfg": meta.get("cfg"), "tokenizer_id": TOKENIZER_ID,
-        "tokenizer_json": tok.backend_tokenizer.to_str(),
+        "cfg": meta.get("cfg"),
+        **tokenizer_payload,
         "transformers_version": __import__("transformers").__version__,
         "tokenizers_version": __import__("tokenizers").__version__,
         "tie_weights": meta.get("tie_weights", False),
@@ -4219,10 +5212,16 @@ def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta):
     }
     if nat_h is not None:
         state["nat"] = _checkpoint_state_dict(nat_h)
-    torch.save(state, tmp, _use_new_zipfile_serialization=False)
+    ckpt_codec = str(codec or "off")
+    state["agillm43_ckpt_codec"] = ckpt_codec
+    info = _agillm43_save_pt(state, tmp, codec=ckpt_codec, zstd_level=1)
     tmp.replace(path)
+    _write_tokenizer_sidecar(path, {k: state.get(k) for k in ("tokenizer_payload_schema", "tokenizer_id", "tokenizer_json", "tokenizer_bundle", "tokenizer_special", "transformers_version", "tokenizers_version") if state.get(k) is not None})
     (path.parent / "latest.json").write_text(json.dumps({"path": str(path), "step": meta["step"]}))
-    print(f"\n✓ saved checkpoint {path.name}")
+    if info.get("codec") == "zstd":
+        print(f"\n✓ saved checkpoint {path.name} codec=zstd ratio={info.get('ratio', 0.0):.2f}x")
+    else:
+        print(f"\n✓ saved checkpoint {path.name} codec=raw")
 
 def load_ckpt(path, core, ar_h, sat_h, opt, scaler, nat_h=None):
     p = _resolve_ckpt(path) or path
@@ -4252,14 +5251,8 @@ def load_ckpt(path, core, ar_h, sat_h, opt, scaler, nat_h=None):
         scaler.load_state_dict(ck["scaler"])
     except Exception as exc:
         print(f"[ckpt] WARNING: scaler state incompatible; resetting scaler ({type(exc).__name__}: {exc})")
-    # Restore tokenizer from checkpoint if available
-    if "tokenizer_json" in ck:
-        try:
-            from tokenizers import Tokenizer as _Tokenizer
-            tok.backend_tokenizer = _Tokenizer.from_str(ck["tokenizer_json"])
-            print("[tokenizer] Restored from checkpoint")
-        except Exception as e:
-            print(f"[tokenizer] WARNING: could not restore from checkpoint: {e}")
+    # Restore tokenizer from checkpoint (embedded json preferred; never raises)
+    _restore_tokenizer_from_ckpt(ck, p)
     # Warn if transformers version changed since checkpoint was saved
     if "transformers_version" in ck:
         import transformers as _tf
@@ -4427,15 +5420,24 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
             if max_age > 0 and now - path.stat().st_mtime > max_age:
                 reject_reason = f"stale update older than {max_age:g}s"
                 raise ValueError(reject_reason)
-            upd = torch.load(path, map_location="cpu", weights_only=False)
+            upd = _agillm43_load_pt(path, map_location="cpu", weights_only=False)
             kind = upd.get("kind")
             if kind not in {"agillm35_dblock_slice_update", "agillm4_dblock_slice_update", "agillm41_dblock_slice_update"}:
                 raise ValueError(f"bad update kind {kind!r}")
             if dict(upd.get("cfg", {})) != dict(cfg):
                 raise ValueError("cfg mismatch")
+            update_mode = "state_lerp"
             block_state = upd.get("block_state")
+            block_delta_state = upd.get("block_delta_state")
+            if block_delta_state is not None:
+                update_mode = "delta_add"
+                block_codec = _agillm43_tensor_state_summary(block_delta_state)
+                block_state = _agillm43_decode_tensor_state(block_delta_state)
+            else:
+                block_codec = _agillm43_tensor_state_summary(block_state)
+                block_state = _agillm43_decode_tensor_state(block_state)
             if not isinstance(block_state, dict) or not block_state:
-                raise ValueError("missing block_state")
+                raise ValueError("missing block_state or block_delta_state")
             changed = 0
             with torch.no_grad():
                 for key, value in block_state.items():
@@ -4447,7 +5449,11 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
                     if tuple(value.shape) != tuple(target.shape):
                         raise ValueError(f"{key} shape mismatch update={tuple(value.shape)} target={tuple(target.shape)}")
                     src = value.to(device=target.device, dtype=target.dtype, non_blocking=True)
-                    if alpha >= 1.0:
+                    if update_mode == "delta_add":
+                        if not target.is_floating_point():
+                            raise ValueError(f"{key} delta update targets non-floating tensor")
+                        target.add_(src, alpha=alpha)
+                    elif alpha >= 1.0:
                         target.copy_(src)
                     else:
                         target.lerp_(src, alpha)
@@ -4463,6 +5469,8 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
                 "tok_per_sec": float(upd.get("tok_per_sec") or 0.0),
                 "alpha": alpha,
                 "keys": changed,
+                "block_codec": block_codec,
+                "update_mode": update_mode,
             }
             applied.append(rec)
             print(json.dumps({"event": "async_side_update_applied", "step": step, **rec}), flush=True)
@@ -4621,6 +5629,274 @@ def make_optimizer(args, core, ar_h, sat_h, lr_core: float, lr_head: float, nat_
         return bnb.optim.AdamW8bit(groups)
     raise ValueError(f"unknown optimizer: {opt_name}")
 
+def _oom_backoff_state_path(args) -> pathlib.Path:
+    configured = str(getattr(args, "oom_memory_path", "") or "").strip()
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    return pathlib.Path(args.save_dir) / "oom_backoff_state.json"
+
+
+def _oom_backoff_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _oom_backoff_cuda_info() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"device": str(DEV), "gpu_name": "cpu", "gpu_total_gb": 0.0}
+    if DEV.type == "cuda":
+        try:
+            prop = torch.cuda.get_device_properties(DEV)
+            info["gpu_name"] = str(prop.name)
+            info["gpu_total_gb"] = round(float(prop.total_memory) / (1024 ** 3), 3)
+        except Exception:
+            pass
+    return info
+
+
+def _oom_backoff_signature(args, block: int) -> Dict[str, Any]:
+    gpu = _oom_backoff_cuda_info()
+    return {
+        "preset": str(getattr(args, "preset", "")),
+        "block": int(block),
+        "amp": bool(getattr(args, "amp", False)),
+        "optimizer": str(getattr(args, "optimizer", "")),
+        "attn_backend": str(getattr(args, "attn_backend", "")),
+        "grad_checkpoint": bool(getattr(args, "grad_checkpoint", False)),
+        "dblock": bool(getattr(args, "dblock", False)),
+        "dblock_blocks": int(getattr(args, "dblock_blocks", 0) or 0),
+        "dblock_checkpoint_stride": int(getattr(args, "dblock_checkpoint_stride", 1) or 0),
+        "dblock_checkpoint_skip_tail": int(getattr(args, "dblock_checkpoint_skip_tail", 0) or 0),
+        "dblock_activation_offload": bool(getattr(args, "dblock_activation_offload", False)),
+        "dblock_objective_mode": str(getattr(args, "dblock_objective_mode", "")),
+        "ar_only": bool(getattr(args, "ar_only", False)),
+        "sat_every": int(getattr(args, "sat_every", 0) or 0),
+        "nat_every": int(getattr(args, "nat_every", 0) or 0),
+        "nat_max_tokens": int(getattr(args, "nat_max_tokens", 0) or 0),
+        "moe_ffn": bool(getattr(args, "moe_ffn", False)),
+        "moe_experts": int(getattr(args, "moe_experts", 0) or 0),
+        "moe_top_k": int(getattr(args, "moe_top_k", 0) or 0),
+        "gpu_name": gpu.get("gpu_name", "unknown"),
+        "gpu_total_gb": gpu.get("gpu_total_gb", 0.0),
+    }
+
+
+def _oom_backoff_key(signature: Dict[str, Any]) -> str:
+    raw = json.dumps(signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def _oom_backoff_load(path: pathlib.Path) -> Dict[str, Any]:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                data.setdefault("schema", "agillm.oom_backoff.v1")
+                data.setdefault("entries", {})
+                return data
+    except Exception as exc:
+        print(f"[oom-backoff] warning: failed to read {path}: {exc}", flush=True)
+    return {"schema": "agillm.oom_backoff.v1", "entries": {}}
+
+
+def _oom_backoff_save(path: pathlib.Path, state: Dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state["updated_utc"] = _oom_backoff_now()
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+    except Exception as exc:
+        print(f"[oom-backoff] warning: failed to write {path}: {exc}", flush=True)
+
+
+def _oom_backoff_entry(state: Dict[str, Any], key: str, signature: Dict[str, Any]) -> Dict[str, Any]:
+    entries = state.setdefault("entries", {})
+    entry = entries.get(key)
+    if not isinstance(entry, dict):
+        entry = {}
+        entries[key] = entry
+    entry["signature"] = signature
+    entry.setdefault("successes", 0)
+    entry.setdefault("ooms", 0)
+    entry.setdefault("events", [])
+    return entry
+
+
+def _oom_backoff_features(signature: Dict[str, Any], batch: int, block: int) -> List[float]:
+    total_gb = float(signature.get("gpu_total_gb", 0.0) or 0.0)
+    return [
+        min(2.0, max(0.0, float(batch) / 128.0)),
+        min(2.0, max(0.0, float(block) / 4096.0)),
+        min(2.0, max(0.0, total_gb / 80.0)),
+        1.0 if signature.get("dblock") else 0.0,
+        min(2.0, max(0.0, float(signature.get("dblock_blocks", 0) or 0) / 32.0)),
+        min(2.0, max(0.0, float(signature.get("dblock_checkpoint_stride", 1) or 0) / 8.0)),
+        1.0 if signature.get("amp") else 0.0,
+        1.0 if "8bit" in str(signature.get("optimizer", "")) else 0.0,
+        1.0 / max(1.0, float(signature.get("sat_every", 1) or 1)),
+        1.0 / max(1.0, float(signature.get("nat_every", 1) or 1)),
+    ]
+
+
+def _oom_mlp_init(entry: Dict[str, Any], key: str, n_features: int) -> Dict[str, Any]:
+    mlp = entry.get("mlp")
+    if isinstance(mlp, dict) and len(mlp.get("w1", [])) == 8:
+        return mlp
+    seed = int(hashlib.sha256(("oom-mlp:" + key).encode("utf-8")).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+    hidden = 8
+    mlp = {
+        "w1": [[rng.uniform(-0.05, 0.05) for _ in range(n_features)] for _ in range(hidden)],
+        "b1": [0.0 for _ in range(hidden)],
+        "w2": [rng.uniform(-0.05, 0.05) for _ in range(hidden)],
+        "b2": 0.0,
+        "seen": 0,
+    }
+    entry["mlp"] = mlp
+    return mlp
+
+
+def _oom_mlp_forward(mlp: Dict[str, Any], features: List[float]) -> Tuple[float, List[float]]:
+    hidden: List[float] = []
+    for row, bias in zip(mlp.get("w1", []), mlp.get("b1", [])):
+        z = float(bias) + sum(float(w) * float(x) for w, x in zip(row, features))
+        hidden.append(math.tanh(z))
+    logit = float(mlp.get("b2", 0.0)) + sum(float(w) * h for w, h in zip(mlp.get("w2", []), hidden))
+    logit = max(-30.0, min(30.0, logit))
+    prob = 1.0 / (1.0 + math.exp(-logit))
+    return prob, hidden
+
+
+def _oom_mlp_update(entry: Dict[str, Any], key: str, signature: Dict[str, Any], batch: int, block: int, label: int) -> float:
+    features = _oom_backoff_features(signature, batch, block)
+    mlp = _oom_mlp_init(entry, key, len(features))
+    prob, hidden = _oom_mlp_forward(mlp, features)
+    lr = 0.04
+    dlogit = prob - float(label)
+    old_w2 = [float(w) for w in mlp["w2"]]
+    for j, h in enumerate(hidden):
+        mlp["w2"][j] = float(mlp["w2"][j]) - lr * dlogit * h
+    mlp["b2"] = float(mlp.get("b2", 0.0)) - lr * dlogit
+    for j, h in enumerate(hidden):
+        dh = dlogit * old_w2[j] * (1.0 - h * h)
+        for i, x in enumerate(features):
+            mlp["w1"][j][i] = float(mlp["w1"][j][i]) - lr * dh * float(x)
+        mlp["b1"][j] = float(mlp["b1"][j]) - lr * dh
+    mlp["seen"] = int(mlp.get("seen", 0) or 0) + 1
+    return prob
+
+
+def _oom_backoff_peak_gb() -> float:
+    if DEV.type != "cuda":
+        return 0.0
+    try:
+        return round(float(torch.cuda.max_memory_allocated()) / (1024 ** 3), 4)
+    except Exception:
+        return 0.0
+
+
+def _oom_backoff_start(args, phase_name: str, block: int, requested_batch: int) -> Tuple[int, Dict[str, Any], pathlib.Path, str, Dict[str, Any]]:
+    path = _oom_backoff_state_path(args)
+    state = _oom_backoff_load(path)
+    signature = _oom_backoff_signature(args, block)
+    key = _oom_backoff_key(signature)
+    entry = _oom_backoff_entry(state, key, signature)
+    batch = int(requested_batch)
+    reasons: List[str] = []
+    safe = int(entry.get("safe_batch", 0) or 0)
+    oom = int(entry.get("oom_batch", 0) or 0)
+    if oom > 0 and batch >= oom:
+        cap = max(1, int(math.floor(oom * float(getattr(args, "oom_backoff_safety", 0.92) or 0.92))))
+        if safe > 0 and safe < oom:
+            cap = min(cap, safe)
+        batch = min(batch, cap)
+        reasons.append(f"known OOM at B={oom}")
+    try:
+        threshold = float(getattr(args, "oom_predict_threshold", 0.70) or 0.70)
+        mlp = _oom_mlp_init(entry, key, len(_oom_backoff_features(signature, batch, block)))
+        if int(mlp.get("seen", 0) or 0) >= 6:
+            while batch > 1:
+                prob, _hidden = _oom_mlp_forward(mlp, _oom_backoff_features(signature, batch, block))
+                if prob < threshold:
+                    break
+                nb = max(1, int(math.floor(batch * float(getattr(args, "oom_backoff_safety", 0.92) or 0.92))))
+                if nb >= batch:
+                    nb = batch - 1
+                reasons.append(f"MLP p_oom={prob:.2f} at B={batch}")
+                batch = nb
+    except Exception as exc:
+        print(f"[oom-backoff] predictor warning: {exc}", flush=True)
+    if batch != requested_batch:
+        print(
+            f"[oom-backoff] {phase_name}: startup cap Batch {requested_batch} -> {batch} "
+            f"({'; '.join(reasons) or 'persistent memory'}) state={path}",
+            flush=True,
+        )
+    _oom_backoff_save(path, state)
+    return int(batch), state, path, key, signature
+
+
+def _oom_backoff_next_batch(args, entry: Dict[str, Any], current_batch: int) -> int:
+    safe = int(entry.get("safe_batch", 0) or 0)
+    factor = float(getattr(args, "oom_backoff_safety", 0.92) or 0.92)
+    candidate = max(1, int(math.floor(current_batch * factor)))
+    if candidate >= current_batch:
+        candidate = current_batch - 1
+    if safe > 0 and safe < current_batch:
+        candidate = min(candidate, safe)
+    return max(1, int(candidate))
+
+
+def _oom_backoff_record(
+    args,
+    state: Dict[str, Any],
+    path: pathlib.Path,
+    key: str,
+    signature: Dict[str, Any],
+    *,
+    outcome: str,
+    batch: int,
+    block: int,
+    step: int,
+    phase_name: str,
+    peak_gb: float = 0.0,
+) -> Dict[str, Any]:
+    entry = _oom_backoff_entry(state, key, signature)
+    label = 1 if outcome == "oom" else 0
+    prob = _oom_mlp_update(entry, key, signature, int(batch), int(block), label)
+    event = {
+        "utc": _oom_backoff_now(),
+        "outcome": outcome,
+        "batch": int(batch),
+        "block": int(block),
+        "step": int(step),
+        "phase": phase_name,
+        "peak_gb": float(peak_gb or 0.0),
+        "mlp_p_oom_before": round(float(prob), 4),
+    }
+    events = entry.setdefault("events", [])
+    events.append(event)
+    del events[:-64]
+    if outcome == "oom":
+        entry["ooms"] = int(entry.get("ooms", 0) or 0) + 1
+        prior = int(entry.get("oom_batch", 0) or 0)
+        entry["oom_batch"] = int(batch) if prior <= 0 else min(prior, int(batch))
+        entry["last_oom_utc"] = event["utc"]
+        entry["last_oom_peak_gb"] = float(peak_gb or 0.0)
+    else:
+        entry["successes"] = int(entry.get("successes", 0) or 0) + 1
+        prior = int(entry.get("safe_batch", 0) or 0)
+        entry["safe_batch"] = max(prior, int(batch))
+        entry["last_safe_utc"] = event["utc"]
+        entry["last_safe_peak_gb"] = float(peak_gb or 0.0)
+    _oom_backoff_save(path, state)
+    return entry
+
+
+def _oom_backoff_enabled(args) -> bool:
+    return bool(getattr(args, "oom_auto_backoff", True))
+
+
+
 def _nat_ids_for_training(ids: torch.Tensor, max_tokens: int) -> torch.Tensor:
     if max_tokens and max_tokens > 0 and ids.size(1) > max_tokens:
         return ids[:, -max_tokens:]
@@ -4638,7 +5914,15 @@ def _train_phase(
     streaming: bool = True
 ):
     BLOCK = block_size
-    BATCH = batch_size
+    BATCH_REQUESTED = int(batch_size)
+    BATCH = BATCH_REQUESTED
+    oom_state: Dict[str, Any] = {}
+    oom_state_path = pathlib.Path(args.save_dir) / "oom_backoff_state.json"
+    oom_key = ""
+    oom_signature: Dict[str, Any] = {}
+    oom_good_steps = 0
+    if _oom_backoff_enabled(args):
+        BATCH, oom_state, oom_state_path, oom_key, oom_signature = _oom_backoff_start(args, phase_name, BLOCK, BATCH)
     if target_tokens_override is not None:
         target_tokens = target_tokens_override
     else:
@@ -4681,7 +5965,7 @@ def _train_phase(
     step = start_step
     steps_since_last_grow = 0
     oom_retries = 0
-    MAX_OOM_RETRIES = 2
+    MAX_OOM_RETRIES = int(getattr(args, "oom_retries_before_backoff", 0) or 0)
     now_wall = time.time()
     last_save_mono = time.monotonic() - (now_wall - (resume_wall_time or now_wall))
     last_delta_step = start_step
@@ -4831,11 +6115,24 @@ def _train_phase(
             msg = str(e).lower()
             if "out of memory" in msg or "cuda error" in msg:
                 batch_accum = []
+                try:
+                    del ids, tgt_ar
+                except Exception:
+                    pass
                 opt.zero_grad(set_to_none=True)
                 scaler = GradScaler(enabled=(args.amp and _needs_grad_scaler()))
+                peak_gb = _oom_backoff_peak_gb()
                 if DEV.type == "cuda":
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                if _oom_backoff_enabled(args):
+                    _oom_backoff_record(args, oom_state, oom_state_path, oom_key, oom_signature, outcome="oom", batch=BATCH, block=BLOCK, step=step, phase_name=phase_name, peak_gb=peak_gb)
                 oom_retries += 1
                 if oom_retries <= MAX_OOM_RETRIES:
                     print(f"\n[{phase_name} OOM] Retry {oom_retries}/{MAX_OOM_RETRIES} at Batch={BATCH}, clearing VRAM...")
@@ -4843,8 +6140,13 @@ def _train_phase(
                     continue
                 oom_retries = 0
                 if BATCH > 1:
-                    print(f"\n[{phase_name} OOM] Reducing Batch: {BATCH} -> {BATCH - 1} (after {MAX_OOM_RETRIES} retries)")
-                    BATCH -= 1
+                    entry = _oom_backoff_entry(oom_state, oom_key, oom_signature) if _oom_backoff_enabled(args) else {}
+                    _nb = _oom_backoff_next_batch(args, entry, BATCH) if _oom_backoff_enabled(args) else max(1, int(BATCH * 0.85))
+                    if _nb >= BATCH:
+                        _nb = BATCH - 1
+                    print(f"\n[{phase_name} OOM] Reducing Batch: {BATCH} -> {_nb} (persistent learned backoff, state={oom_state_path})")
+                    BATCH = _nb
+                    oom_good_steps = 0
                     time.sleep(2)
                 else:
                     new_block = max(128, int(BLOCK * 0.8))
@@ -4853,6 +6155,9 @@ def _train_phase(
                         new_block = max(128, BLOCK - 128)
                     print(f"\n[{phase_name} OOM] Reducing Block: {BLOCK} -> {new_block}")
                     BLOCK = new_block
+                    oom_good_steps = 0
+                    if _oom_backoff_enabled(args):
+                        BATCH, oom_state, oom_state_path, oom_key, oom_signature = _oom_backoff_start(args, phase_name, BLOCK, BATCH)
                     time.sleep(2)
                 steps_since_last_grow = 0
                 continue
@@ -4869,6 +6174,11 @@ def _train_phase(
             except Exception:
                 pass
         oom_retries = 0
+        if _oom_backoff_enabled(args):
+            oom_good_steps += 1
+            good_every = max(1, int(getattr(args, "oom_warmup_good_steps", 16) or 16))
+            if oom_good_steps in (1, good_every) or (oom_good_steps % max(1, good_every * 4) == 0):
+                _oom_backoff_record(args, oom_state, oom_state_path, oom_key, oom_signature, outcome="success", batch=BATCH, block=BLOCK, step=step, phase_name=phase_name, peak_gb=_oom_backoff_peak_gb())
         toks_processed = BLOCK * BATCH
         seen_tok += toks_processed
         pbar.set_postfix(loss=f"{loss_value:.3f}", B=BATCH, L=BLOCK)
@@ -4906,7 +6216,13 @@ def _train_phase(
                     "seen_tok": int(seen_tok),
                     "loss": float(loss_value),
                     "batch_size": int(BATCH),
+                    "requested_batch_size": int(BATCH_REQUESTED),
                     "block": int(BLOCK),
+                    "oom_backoff": {
+                        "enabled": bool(_oom_backoff_enabled(args)),
+                        "state_path": str(oom_state_path),
+                        "key": str(oom_key),
+                    },
                     "dblock": bool(getattr(args, "dblock", False)),
                     "structured_masks": bool(use_structured_masks(args)),
                     "device": str(DEV),
@@ -4965,7 +6281,8 @@ def _train_phase(
             _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-flush-save")
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
             save_ckpt(pathlib.Path(args.save_dir) / _ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
-                      meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights})
+                      meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights},
+                      codec=getattr(args, "ckpt_codec", "zstd3"))
             last_save_mono = time.monotonic()
             _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
             last_delta_step = step
@@ -4978,7 +6295,8 @@ def _train_phase(
                 _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-save")
                 _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
                 save_ckpt(pathlib.Path(args.save_dir) / ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
-                          meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights})
+                          meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights},
+                          codec=getattr(args, "ckpt_codec", "zstd3"))
                 last_save_mono = now_mono
                 # Prune old deltas after a full save (they're superseded)
                 _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
@@ -4991,7 +6309,7 @@ def _train_phase(
             if args.delta_max_keep and args.delta_max_keep > 0:
                 _flush_delta()
                 _prune_delta_files_to_count(save_root, phase_name, args.delta_max_keep - 1)
-            save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name)
+            save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"))
             last_delta_step = step
         if args.auto_grow:
             steps_since_last_grow += 1
@@ -5009,7 +6327,8 @@ def _train_phase(
     _flush_delta()  # ensure any in-flight delta completes before final save
     if phase_name != "sft":
         save_ckpt(pathlib.Path(args.save_dir) / f"{phase_name}_final.pt", core, ar_h, sat_h, nat_h, opt, scaler,
-                  meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights})
+                  meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights},
+                  codec=getattr(args, "ckpt_codec", "zstd3"))
     else:
         print("[sft] Skipping duplicate sft_final.pt; final.pt will contain the SFT result.")
     return step, seen_tok, time.time()
@@ -5196,7 +6515,8 @@ def train(args):
             streaming=True
         )
     save_ckpt(pathlib.Path(args.save_dir) / "final.pt", core, ar_h, sat_h, nat_h, opt, scaler,
-              meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights})
+              meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights},
+              codec=getattr(args, "ckpt_codec", "zstd3"))
     print("🎉 All Training Complete")
 
 
@@ -5570,7 +6890,7 @@ def infer(args):
     if args.mode == "sat":
         min_new = max(min_new, SAT_BLOCK)
     path = _resolve_ckpt(pathlib.Path(args.ckpt)) or pathlib.Path(args.ckpt)
-    sd = torch.load(path, map_location="cpu")
+    sd = _agillm43_load_pt(path, map_location="cpu", weights_only=False)
     # Inference never needs optimizer/scaler state. Drop it before model construction
     # so block-stream runs keep CPU RAM pressure lower after checkpoint load.
     if isinstance(sd, dict):
@@ -5578,14 +6898,8 @@ def infer(args):
         sd.pop("scaler", None)
         import gc as _gc
         _gc.collect()
-    # Restore tokenizer from checkpoint if available
-    if "tokenizer_json" in sd:
-        try:
-            from tokenizers import Tokenizer as _Tokenizer
-            tok.backend_tokenizer = _Tokenizer.from_str(sd["tokenizer_json"])
-            print("[tokenizer] Restored from checkpoint")
-        except Exception as e:
-            print(f"[tokenizer] WARNING: could not restore from checkpoint: {e}")
+    # Restore tokenizer from checkpoint (embedded json preferred; never raises)
+    _restore_tokenizer_from_ckpt(sd, path)
     # Warn if transformers version changed since checkpoint was saved
     if "transformers_version" in sd:
         import transformers as _tf
@@ -6082,8 +7396,15 @@ def _agillm43_prepare_env(save_dir, side_dir):
             "/workspace/agillm_private/openrouter_api_key",
         ),
     )
+    env.setdefault("AGILLM_MAX_EXAMPLE_TOKENS", "4096")
+    env.setdefault("AGILLM_MAX_EXAMPLE_CHARS", "32768")
+    env.setdefault("AGILLM_DATASET_NN_ROUTER", "1")
+    env.setdefault("AGILLM_DATASET_ROUTER_EXPLORE", "0.08")
+    env.setdefault("AGILLM_DATASET_ROUTER_MIN_SCORE", "0.12")
+    env.setdefault("AGILLM_DATASET_ROUTER_SHARPNESS", "2.0")
+    env.setdefault("AGILLM_DATASET_ROUTER_TARGET_TOKENS", "2048")
     if have_deepseek or have_openrouter:
-        env.setdefault("AGILLM_DATASET_AGENT_ROUTER", "1")
+        env.setdefault("AGILLM_DATASET_AGENT_ROUTER", "0")
         env.setdefault("AGILLM_DATASET_AGENT_PROVIDER", "auto")
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     for name in ("incoming", "accepted", "rejected"):
@@ -6177,7 +7498,17 @@ def _agillm43_convert_resume_delta(save_dir, log_path):
         _agillm43_log_json(log_path, "native_supervisor_resume_delta_current", source=src_meta, path=str(out))
         return str(out)
 
-    ck = torch.load(src_path, map_location="cpu", weights_only=False)
+    ck = _agillm43_load_pt(src_path, map_location="cpu", weights_only=False)
+    tok_keys = ("tokenizer_payload_schema", "tokenizer_id", "tokenizer_json", "tokenizer_bundle", "tokenizer_special", "transformers_version", "tokenizers_version")
+    tok_payload = {}
+    sidecar_payload = _read_tokenizer_sidecar(src_path)
+    tok_payload.update({k: v for k, v in sidecar_payload.items() if k in tok_keys and v is not None})
+    tok_payload.update({k: ck.get(k) for k in tok_keys if isinstance(ck, dict) and ck.get(k) is not None})
+    if not tok_payload.get("tokenizer_json") or not tok_payload.get("tokenizer_bundle") or not tok_payload.get("tokenizer_special"):
+        runtime_payload = _tokenizer_payload()
+        tok_payload = {**runtime_payload, **tok_payload}
+    tok_payload.setdefault("tokenizer_payload_schema", 2)
+    src_meta["tokenizer_payload_schema"] = int(tok_payload.get("tokenizer_payload_schema", 2) or 2)
     delta = {
         "delta": True,
         "weights": {k: ck[k] for k in ("core", "ar", "sat", "nat") if k in ck},
@@ -6185,9 +7516,10 @@ def _agillm43_convert_resume_delta(save_dir, log_path):
         "seen_tok": ck.get("seen_tok", 0),
         "cfg": ck.get("cfg"),
         "source_checkpoint": src_meta,
+        **tok_payload,
     }
     tmp = str(out) + ".tmp"
-    torch.save(delta, tmp)
+    _agillm43_save_pt(delta, tmp, codec=os.environ.get("AGILLM43_DELTA_CODEC", "zstd3"))
     os.replace(tmp, out)
     mark.write_text(json.dumps(src_meta, sort_keys=True))
     try:
@@ -6198,7 +7530,7 @@ def _agillm43_convert_resume_delta(save_dir, log_path):
     return str(out)
 
 
-AGILLM43_PROFILE_CHOICES = ("normal", "sat_repair", "sat_probe")
+AGILLM43_PROFILE_CHOICES = ("normal", "ar_repair", "full_ar_repair", "sat_repair", "sat_probe")
 
 
 def _agillm43_profile_config(profile):
@@ -6208,6 +7540,23 @@ def _agillm43_profile_config(profile):
             "ar_prob": "0.60", "sat_prob": "0.25", "nat_prob": "0.15",
             "ar_loss_tokens": "512", "sat_loss_tokens": "512", "nat_loss_tokens": "512",
             "sat_every": "1", "nat_every": "4",
+        },
+        "ar_repair": {
+            # Hybrid-safe recovery mode. Keep AR emphasis for text quality, but
+            # never disable SAT/NAT; AGILLM-4.3 is meant to recover as a hybrid.
+            "ar_prob": "0.55", "sat_prob": "0.30", "nat_prob": "0.15",
+            "ar_loss_tokens": "768", "sat_loss_tokens": "768", "nat_loss_tokens": "512",
+            "sat_every": "1", "nat_every": "4",
+        },
+        "full_ar_repair": {
+            # Historical profile name retained, but AGILLM4.3 remains a hybrid:
+            # DBLOCK + AR + SAT + NAT all stay live during repair.
+            "ar_prob": "0.60", "sat_prob": "0.25", "nat_prob": "0.15",
+            "ar_loss_tokens": "1024", "sat_loss_tokens": "768", "nat_loss_tokens": "512",
+            "sat_every": "1", "nat_every": "4",
+            "batch_size": "2", "block": "768", "steps": "500",
+            "lr_core": "1e-5", "lr_head": "5e-5",
+            "save_every_sec": "900",
         },
         "sat_repair": {
             "ar_prob": "0.45", "sat_prob": "0.40", "nat_prob": "0.15",
@@ -6228,7 +7577,6 @@ def _agillm43_profile_config(profile):
 
 
 def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", warmstart_from=None):
-    import os
     import sys
     from pathlib import Path
     script = str(Path(__file__).resolve())
@@ -6240,23 +7588,26 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         sys.executable, "-u", script, "train",
         "--preset", "agillm4_floor", "--tie_kv", "--resume_delta", resume_delta,
         *(["--warmstart_from", str(warmstart_from)] if warmstart_from else []),
-        "--dblock", "--dblock_blocks", str(os.environ.get("AGILLM43_DBLOCK_BLOCKS", "14")), "--dblock_schedule", "loss_balanced",
-        "--dblock_router", "heuristic", "--dblock_router_blend", "0.35", "--dblock_router_ramp_steps", "256",
+        "--dblock", "--dblock_blocks", os.environ.get("AGILLM43_DBLOCK_BLOCKS", "14"), "--dblock_schedule", "loss_balanced",
+        "--dblock_router", "transformer", "--dblock_router_blend", "0.35", "--dblock_router_ramp_steps", "256",
         "--dblock_warmup_steps", "16", "--dblock_sigma_curriculum_steps", "2000",
-        "--dblock_log_every", "25", "--dblock_sigma_sampling", "lognormal", "--dblock_sigma_stratified",
-        "--dblock_objective_mode", "stochastic",
+        "--dblock_sigma_sampling", "lognormal", "--dblock_sigma_stratified",
+        "--dblock_log_every", "25", "--dblock_objective_mode", "stochastic",
         "--dblock_ar_prob", prof["ar_prob"], "--dblock_sat_prob", prof["sat_prob"], "--dblock_nat_prob", prof["nat_prob"],
         "--dblock_ar_loss_tokens", prof["ar_loss_tokens"], "--dblock_sat_loss_tokens", prof["sat_loss_tokens"], "--dblock_nat_loss_tokens", prof["nat_loss_tokens"],
         "--moe_ffn", "--moe_experts", "2", "--moe_top_k", "1", "--moe_mlp_mult", "4",
         "--moe_shared_experts", "1", "--moe_shared_mlp_mult", "2", "--moe_aux_coef", "0.01", "--moe_z_coef", "0.001",
-        "--tie_weights", "--batch_size", "18", "--block", "1536", "--amp", "--attn_backend", "sdpa",
+        "--tie_weights", "--batch_size", prof.get("batch_size", os.environ.get("AGILLM43_BATCH_SIZE", "22")), "--block", prof.get("block", os.environ.get("AGILLM43_BLOCK", "1536")),
+        *(["--steps", prof["steps"]] if "steps" in prof else []),
+        "--amp", "--attn_backend", os.environ.get("AGILLM43_ATTN_BACKEND", "sdpa"),
         "--sublinear_window", "128", "--sublinear_stride", "128", "--sublinear_max_anchors", "128", "--sublinear_chunk", "128",
         "--sublinear_sinks", "4", "--sublinear_recent_anchors", "64", "--no-sublinear_pooled_landmarks",
         "--dblock_checkpoint_stride", "1", "--optimizer", "adamw8bit",
         "--loss_spike_skip", "3.0", "--sat_every", prof["sat_every"], "--nat_every", prof["nat_every"],
+        *(["--lr_core", prof["lr_core"], "--lr_head", prof["lr_head"]] if "lr_core" in prof and "lr_head" in prof else []),
         "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
         "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
-        "--save_dir", str(save_dir), "--save_every_sec", "14400", "--heartbeat_every_sec", "300",
+        "--save_dir", str(save_dir), "--save_every_sec", prof.get("save_every_sec", "14400"), "--heartbeat_every_sec", "300",
         "--empty_cache_every_steps", "0", "--delta_every_steps", "25000", "--delta_max_keep", "1", "--max_ckpts", "1",
         "--async_update_dir", incoming, "--async_update_every_steps", "100", "--async_update_alpha", "0.05",
         "--async_update_max_per_check", "2", "--async_update_max_age_sec", "86400",
@@ -6485,6 +7836,18 @@ def main():
                     help="Training stream shuffle seed. -1 derives a per-restart seed from the resume step so restarts do not re-train identical early data.")
     tr.add_argument("--heartbeat_every_sec", type=int, default=300,
                     help="Print lightweight trainer heartbeat/status lines every N seconds; 0 disables.")
+    tr.add_argument("--oom_auto_backoff", action=argparse.BooleanOptionalAction, default=True,
+                    help="Persist learned CUDA OOM batch/block limits and cap future launches before they OOM.")
+    tr.add_argument("--oom_memory_path", default="",
+                    help="Optional JSON path for persistent OOM backoff memory. Defaults to <save_dir>/oom_backoff_state.json.")
+    tr.add_argument("--oom_backoff_safety", type=float, default=0.92,
+                    help="Safety multiplier used after a known OOM or high OOM prediction.")
+    tr.add_argument("--oom_predict_threshold", type=float, default=0.70,
+                    help="Tiny online MLP OOM probability above which startup batch is capped.")
+    tr.add_argument("--oom_warmup_good_steps", type=int, default=16,
+                    help="Steps at one batch size before it is re-recorded as a stable safe batch.")
+    tr.add_argument("--oom_retries_before_backoff", type=int, default=0,
+                    help="OOM retries at the same batch before reducing. 0 immediately backs off and remembers.")
     tr.add_argument("--empty_cache_every_steps", type=int, default=0,
                     help="Call torch.cuda.empty_cache() every N train steps; useful for VRAM-first runs where lower reserved VRAM matters more than speed.")
     tr.add_argument("--profile_steps", type=int, default=0,
@@ -6493,6 +7856,10 @@ def main():
                     help="Print averaged profiler timings every N profiled steps.")
     tr.add_argument("--delta_every_steps", type=int, default=DEFAULT_DELTA_STEPS, help="Weight-only delta save every N steps (0=off)")
     tr.add_argument("--delta_max_keep", type=int, default=DEFAULT_MAX_DELTAS, help="Max delta checkpoints to keep")
+    tr.add_argument("--delta_codec", default=os.environ.get("AGILLM43_DELTA_CODEC", "zstd3"),
+                    help="Delta checkpoint payload codec: off/raw, zstd, or zstdN such as zstd3. zstd modes are lossless and accepted by load_delta.")
+    tr.add_argument("--ckpt_codec", default=os.environ.get("AGILLM43_CKPT_CODEC", "zstd3"),
+                    help="Full checkpoint payload codec: off/raw, zstd, or zstdN such as zstd3. zstd modes are lossless and accepted by load_ckpt, infer, and resume-delta conversion.")
     tr.add_argument("--resume_delta", type=str, help="Resume from a delta (weight-only, no optimizer state)")
     tr.add_argument("--async_update_dir", default="",
                     help="Optional incoming directory for verified DBlock side updates. Empty disables async side updates.")
@@ -6513,7 +7880,7 @@ def main():
     tr.add_argument("--x2", action="store_true")
     tr.add_argument("--warmstart_from", type=str)
     tr.add_argument("--fresh", action="store_true")
-    tr.add_argument("--max_ckpts", type=int, default=None)
+    tr.add_argument("--max_ckpts", type=int, default=2)
     tr.add_argument("--chilla_max_double", action="store_true")
     tr.add_argument("--tie_weights", action="store_true")
     tr.add_argument("--ar_only", action="store_true")
@@ -6530,6 +7897,10 @@ def main():
                     help="Repeat tokens this many times for the NAT CTC input length.")
     tr.add_argument("--nat_max_tokens", type=int, default=0,
                     help="Optional cap for NAT target tokens per batch; 0 uses the whole block.")
+    tr.add_argument("--dblock_nat_embed_noise_mode", choices=["off", "visible", "mask_plus_noise"], default="mask_plus_noise",
+                    help="NAT embedding noise mode. off=standard BLANK masking. visible=add noise to clean embeddings. mask_plus_noise=BLANK mask + noise on masked positions.")
+    tr.add_argument("--dblock_nat_embed_noise_scale", type=float, default=1.0,
+                    help="Scale factor for embedding noise in NAT hybrid modes.")
     tr.add_argument("--nat_mask_ratio", type=float, default=0.5,
                     help="Fraction of positions masked to BLANK for the NAT mask-predict (CMLM) objective.")
     tr.add_argument("--tie_kv", action=argparse.BooleanOptionalAction, default=False,
@@ -6558,15 +7929,15 @@ def main():
     tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "loss_balanced"], default="loss_balanced",
                     help="How --dblock chooses the next layer block. loss_balanced focuses blocks whose EMA loss is highest after warmup.")
     tr.add_argument("--dblock_router", choices=["heuristic", "transformer"], default="heuristic",
-                    help="Optional learned transformer scheduler for DBlock layer-band selection; coverage guards still enforce fairness.")
-    tr.add_argument("--dblock_router_hidden", type=int, default=32,
-                    help="Hidden width for the tiny transformer DBlock router.")
+                    help="Optional learned sequence-Transformer scheduler for DBlock layer-band selection; coverage guards still enforce fairness.")
+    tr.add_argument("--dblock_router_hidden", type=int, default=64,
+                    help="Hidden width for the context/history sequence-Transformer DBlock router.")
     tr.add_argument("--dblock_router_heads", type=int, default=4,
-                    help="Attention heads for the tiny transformer DBlock router.")
-    tr.add_argument("--dblock_router_layers", type=int, default=1,
-                    help="Transformer encoder layers for the tiny DBlock router.")
+                    help="Attention heads for the context/history sequence-Transformer DBlock router.")
+    tr.add_argument("--dblock_router_layers", type=int, default=2,
+                    help="Transformer encoder layers for the context/history sequence-Transformer DBlock router.")
     tr.add_argument("--dblock_router_lr", type=float, default=0.002,
-                    help="Online learning rate for the tiny transformer DBlock router.")
+                    help="Online learning rate for the context/history sequence-Transformer DBlock router.")
     tr.add_argument("--dblock_router_blend", type=float, default=0.35,
                     help="Max blend of learned-router score into heuristic DBlock score after ramp-up.")
     tr.add_argument("--dblock_router_ramp_steps", type=int, default=256,
@@ -6585,6 +7956,8 @@ def main():
                     help="Loss-score bonus for under-sampled DBlocks before the hard count-skew guard triggers.")
     tr.add_argument("--dblock_log_every", type=int, default=25,
                     help="Print DBlock block/loss/VRAM diagnostics every N DBlock steps; 0 disables.")
+    tr.add_argument("--dblock_sublayer_mode", choices=["off", "full", "attn_only", "ffn_only", "split_alt", "cycle"], default="off",
+                    help="Experimental dormant knob: train only transformer sublayers inside selected DiffusionBlocks. off/full keeps normal Block.forward; attn_only trains LN1+attention residual; ffn_only trains LN2+FFN/MoE residual; split_alt alternates attention/FFN by step; cycle rotates full/FFN/attention.")
     tr.add_argument("--dblock_checkpoint_stride", type=int, default=1,
                     help="With --grad_checkpoint in --dblock mode, checkpoint one layer every N selected block layers; 1=all layers, 2=alternate, 0=off.")
     tr.add_argument("--dblock_checkpoint_skip_tail", type=int, default=0,
@@ -6596,19 +7969,17 @@ def main():
     tr.add_argument("--dblock_sigma_curriculum_steps", type=int, default=2000,
                     help="Warm sigma ranges from easy to full span over this many DBlock steps; 0 disables.")
     tr.add_argument("--dblock_sigma_sampling", choices=["lognormal", "truncated_lognormal", "edm", "log_uniform"], default="lognormal",
-                    help="Sample sigma inside each block interval from the DBT log-normal prior; log_uniform preserves the legacy sampler.")
-    tr.add_argument("--dblock_sigma_stratified", dest="dblock_sigma_stratified", action="store_true", default=True,
-                    help="Use randomized quantile strata inside each DBlock sigma interval to reduce batch-level noise.")
-    tr.add_argument("--no-dblock_sigma_stratified", dest="dblock_sigma_stratified", action="store_false",
-                    help="Disable randomized quantile-stratified DBlock sigma sampling.")
+                    help="Sigma sampling inside each DBlock interval. lognormal/truncated_lognormal follows the DBT/EDM p_noise conditional; log_uniform is the legacy sampler.")
+    tr.add_argument("--dblock_sigma_stratified", action=argparse.BooleanOptionalAction, default=True,
+                    help="Use randomized quantile strata for log-normal DBlock sigma sampling; reduces per-step sigma Monte Carlo variance.")
     tr.add_argument("--dblock_sigma_min", type=float, default=0.002,
-                    help="Minimum sigma for DiffusionBlocks log-normal block boundaries.")
+                    help="Minimum sigma for DBlock equi-probability partitioning.")
     tr.add_argument("--dblock_sigma_max", type=float, default=80.0,
-                    help="Maximum sigma for DiffusionBlocks log-normal block boundaries.")
+                    help="Maximum sigma for DBlock equi-probability partitioning.")
     tr.add_argument("--dblock_sigma_pmean", type=float, default=-1.2,
-                    help="Log-normal mean used for DiffusionBlocks sigma boundaries and sampling.")
+                    help="Mean of log(sigma) for DBlock log-normal p_noise.")
     tr.add_argument("--dblock_sigma_pstd", type=float, default=1.2,
-                    help="Log-normal stddev used for DiffusionBlocks sigma boundaries and sampling.")
+                    help="Stddev of log(sigma) for DBlock log-normal p_noise.")
     tr.add_argument("--dblock_edm_wmax", type=float, default=5.0,
                     help="Cap for EDM loss weighting in DBlock mode.")
     tr.add_argument("--dblock_ar_weight", type=float, default=1.0)
@@ -6719,7 +8090,7 @@ def main():
     sup.add_argument("--dedupe", action=argparse.BooleanOptionalAction, default=True)
     sup.add_argument("--once", action="store_true")
     sup.add_argument("--profile", choices=AGILLM43_PROFILE_CHOICES, default="normal",
-                     help="Training launch profile: normal, sat_repair, or sat_probe.")
+                     help="Training launch profile: normal, ar_repair, full_ar_repair, sat_repair, or sat_probe.")
     hp = sub.add_parser("hotpatch", help="Flush checkpoint and restart under native AGILLM4.3 supervisor")
     hp.add_argument("--save_dir", default="/workspace/agillm4_4090_ckpts")
     hp.add_argument("--side_dir", default="/workspace/agillm41_side_updates")

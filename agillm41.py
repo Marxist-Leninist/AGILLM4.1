@@ -19,6 +19,7 @@ _agillm41_sys.modules.setdefault("nB300_agillm4", _agillm41_sys.modules[__name__
 _agillm41_sys.modules.setdefault("agillm35", _agillm41_sys.modules[__name__])
 _agillm41_sys.modules.setdefault("agillm41", _agillm41_sys.modules[__name__])
 
+import agillm_checkpoint_provenance as _agillm_provenance
 
 
 # ===== BEGIN anchor_memory.py =====
@@ -134,7 +135,7 @@ import torch
 class FusedCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, W, tgt, vchunk=16384):
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.cuda.amp.autocast(enabled=True):
             hf = h.float()
             Wf = W.float()
             N, d = h.shape
@@ -162,7 +163,7 @@ class FusedCE(torch.autograd.Function):
         vc = ctx.vchunk
         N, d = h.shape
         V = W.shape[0]
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.cuda.amp.autocast(enabled=True):
             hf = h.float()
             Wc_all = W.float()
             gh = torch.zeros_like(hf)
@@ -1575,8 +1576,71 @@ def _status_format_int(value: Optional[int]) -> str:
 
 
 def _status_parse_step(text: str) -> Optional[int]:
-    match = _STATUS_STEP_RE.search(text)
+    match = _STATUS_STEP_RE.search(str(text or ""))
     return int(match.group("step")) if match else None
+
+
+def _agillm43_lineage_info(source_path: Optional[str], source_provenance: Optional[dict], save_dir: str = "") -> Dict[str, Any]:
+    source_path = str(source_path or "")
+    try:
+        source_abs = os.path.abspath(source_path) if source_path else ""
+    except Exception:
+        source_abs = source_path
+    try:
+        save_abs = os.path.abspath(str(save_dir or "")) if save_dir else ""
+    except Exception:
+        save_abs = str(save_dir or "")
+    master_marker = f"{os.sep}agillm4_v100_master_ckpts{os.sep}"
+    if not source_path:
+        warmstart_kind = "from_scratch"
+    elif master_marker in source_abs:
+        warmstart_kind = "warmstarted_from_master"
+    elif save_abs and source_abs.startswith(save_abs + os.sep):
+        warmstart_kind = "warmstarted_from_lane_checkpoint"
+    else:
+        warmstart_kind = "warmstarted_from_non_master_checkpoint"
+
+    source_step = _status_parse_step(source_path)
+    origin_step = 0
+    origin_seen_tok = 0
+    if isinstance(source_provenance, dict):
+        for key in ("global_origin_step", "warmstart_base_step"):
+            try:
+                value = int(source_provenance.get(key) or 0)
+            except Exception:
+                value = 0
+            if value > 0:
+                origin_step = value
+                break
+        if origin_step <= 0:
+            parent = source_provenance.get("warmstart_source_path") or source_provenance.get("source_path") or ""
+            parent_step = _status_parse_step(parent)
+            if parent_step and parent_step >= 1_000_000:
+                origin_step = parent_step
+        for key in ("global_origin_seen_tok", "warmstart_base_seen_tok"):
+            try:
+                value = int(source_provenance.get(key) or 0)
+            except Exception:
+                value = 0
+            if value > 0:
+                origin_seen_tok = value
+                break
+    if origin_step <= 0 and source_step and (warmstart_kind == "warmstarted_from_master" or source_step >= 1_000_000):
+        origin_step = int(source_step)
+
+    return {
+        "source_path": source_path,
+        "source_step": int(source_step or 0),
+        "warmstart_kind": warmstart_kind,
+        "created_from_scratch": warmstart_kind == "from_scratch",
+        "source_is_master_checkpoint": warmstart_kind == "warmstarted_from_master",
+        "source_is_lane_checkpoint": warmstart_kind == "warmstarted_from_lane_checkpoint",
+        "source_is_non_master_checkpoint": warmstart_kind == "warmstarted_from_non_master_checkpoint",
+        "warmstart_base_step": int(origin_step or 0),
+        "global_origin_step": int(origin_step or 0),
+        "warmstart_base_seen_tok": int(origin_seen_tok or 0),
+        "global_origin_seen_tok": int(origin_seen_tok or 0),
+    }
 
 
 def _status_resolve_ckpt_path(raw_path: str, base_dir: Path) -> Path:
@@ -1590,6 +1654,16 @@ def _status_read_cmdline(proc_dir: Path) -> Optional[List[str]]:
         return [item.decode("utf-8", errors="ignore") for item in data if item]
     except Exception:
         return None
+
+
+def _status_get_arg_value(args: List[str], flag: str) -> Optional[str]:
+    for idx, arg in enumerate(args):
+        if arg == flag and idx + 1 < len(args):
+            return args[idx + 1]
+        prefix = flag + "="
+        if arg.startswith(prefix):
+            return arg[len(prefix):]
+    return None
 
 
 def _status_resolve_proc_arg(proc_dir: Path, raw_arg: str) -> Optional[Path]:
@@ -1638,11 +1712,15 @@ def _status_find_trainers(script_path: Path) -> List[Dict[str, Any]]:
             cwd = str(Path(os.readlink(proc_dir / "cwd")))
         except Exception:
             cwd = None
+        save_dir_arg = _status_get_arg_value(args, "--save_dir")
+        save_dir_resolved = _status_resolve_proc_arg(proc_dir, save_dir_arg) if save_dir_arg else None
         matches.append({
             "pid": int(proc_dir.name),
             "cmdline": " ".join(args),
             "args": args,
             "cwd": cwd,
+            "save_dir_arg": save_dir_arg,
+            "save_dir_resolved": str(save_dir_resolved) if save_dir_resolved is not None else None,
             "uptime_seconds": round(uptime_seconds, 3) if uptime_seconds is not None else None,
             "uptime_human": _status_human_duration(uptime_seconds),
         })
@@ -1750,6 +1828,22 @@ def _status_latest_full_checkpoint(save_dir: Path, base_dir: Path) -> tuple[Dict
     raw_path = payload.get("path")
     info["raw_path"] = raw_path
     info["step"] = payload.get("step")
+    for key in (
+        "warmstart_kind", "warmstart_source_path", "checkpoint_summary",
+        "effective_global_step", "global_origin_step", "warmstart_base_step",
+        "effective_seen_tok", "global_origin_seen_tok", "warmstart_base_seen_tok",
+    ):
+        if key in payload:
+            info[key] = payload.get(key)
+    provenance = payload.get("agillm43_provenance") or {}
+    if isinstance(provenance, dict):
+        info["agillm43_provenance"] = provenance
+        for key in (
+            "effective_global_step", "global_origin_step", "warmstart_base_step",
+            "effective_seen_tok", "global_origin_seen_tok", "warmstart_base_seen_tok",
+        ):
+            if key not in info and key in provenance:
+                info[key] = provenance.get(key)
     if raw_path:
         ckpt_path = _status_resolve_ckpt_path(raw_path, base_dir)
         info["checkpoint_path"] = str(ckpt_path)
@@ -1782,7 +1876,7 @@ def _status_newest_delta(save_dir: Path) -> tuple[Optional[Dict[str, Any]], List
         return None, warnings
     newest = max(candidates, key=lambda item: item.stat().st_mtime)
     st = newest.stat()
-    return {
+    info = {
         "path": str(newest),
         "name": newest.name,
         "step": _status_parse_step(newest.name),
@@ -1790,7 +1884,24 @@ def _status_newest_delta(save_dir: Path) -> tuple[Optional[Dict[str, Any]], List
         "mtime_iso": _status_iso(st.st_mtime),
         "size_bytes": st.st_size,
         "source": "disk",
-    }, warnings
+    }
+    sidecar = newest.with_suffix(".provenance.json")
+    info["provenance_sidecar_path"] = str(sidecar)
+    info["provenance_sidecar_exists"] = sidecar.exists()
+    if sidecar.exists():
+        try:
+            provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+            info["agillm43_provenance"] = provenance
+            for key in (
+                "warmstart_kind", "warmstart_source_path", "local_step",
+                "effective_global_step", "global_origin_step", "warmstart_base_step",
+                "effective_seen_tok", "global_origin_seen_tok", "warmstart_base_seen_tok",
+            ):
+                if key in provenance:
+                    info[key] = provenance.get(key)
+        except Exception as exc:
+            warnings.append(f"failed to parse delta provenance sidecar {sidecar}: {exc}")
+    return info, warnings
 
 
 def _status_gpu_info() -> tuple[Optional[Dict[str, Any]], List[str]]:
@@ -1898,8 +2009,17 @@ def _collect_status(log_path: Path, save_dir: Path) -> tuple[Dict[str, Any], int
     warnings = status["warnings"]
 
     matches = _status_find_trainers(STATUS_SCRIPT_PATH)
+    requested_resolved = requested_save_dir.resolve()
+    save_dir_matches = [
+        item for item in matches
+        if item.get("save_dir_resolved") and Path(item["save_dir_resolved"]).resolve() == requested_resolved
+    ]
+    if save_dir_matches:
+        matches = save_dir_matches
+    elif len(matches) > 1:
+        warnings.append(f"no active trainer command line matched requested save_dir exactly: {requested_resolved}")
     if len(matches) > 1:
-        status["error"] = "multiple active n.py train processes found"
+        status["error"] = f"multiple active {STATUS_SCRIPT_PATH.name} train processes found"
         status["processes"] = matches
         return status, 1
     if matches:
@@ -5132,7 +5252,7 @@ def _fuse_legacy_qkv_optimizer_state(opt_state: dict, opt, core, ar_h, sat_h, na
 
     return {"state": new_states, "param_groups": new_groups}
 
-def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str, delta_codec: str = "zstd3"):
+def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str, delta_codec: str = "zstd3", provenance=None):
     """Save weight-only delta in background thread. Non-blocking."""
     global _delta_thread
     # Wait for any previous delta write to finish
@@ -5148,6 +5268,16 @@ def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pat
         if nat_h is not None:
             tensors["nat"] = {k: v.detach().cpu() for k, v in _checkpoint_state_dict(nat_h).items()}
     meta = {"step": step, "seen_tok": seen_tok, "wall_time": time.time(), "delta": True, "agillm43_delta_codec": str(delta_codec or "off"), **_tokenizer_payload()}
+    # Add provenance to delta checkpoints so hourly durable artifacts carry lineage.
+    try:
+        if provenance is not None:
+            _agillm_provenance.embed(meta, dict(provenance))
+        else:
+            _agillm_provenance.embed(meta, _agillm_provenance.collect(None,
+                step=step, seen_tok=seen_tok, loss=0.0,
+                batch_size=0, block_size=0, checkpoint_type="delta"))
+    except Exception:
+        pass
     path = save_dir / f"{phase_name}_delta_step{step:08d}.pt"
     _delta_thread = threading.Thread(target=_do_delta_save, args=(tensors, path, meta, delta_codec), daemon=True)
     _delta_thread.start()
@@ -5443,7 +5573,7 @@ def _flush_delta():
         print("  [delta] flushing in-flight write...")
         _delta_thread.join(timeout=120)
 
-def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, codec: str = "zstd"):
+def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, codec: str = "zstd", provenance=None):
     path.parent.mkdir(exist_ok=True, parents=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tokenizer_payload = _tokenizer_payload()
@@ -5462,10 +5592,52 @@ def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, c
         state["nat"] = _checkpoint_state_dict(nat_h)
     ckpt_codec = str(codec or "off")
     state["agillm43_ckpt_codec"] = ckpt_codec
+    if provenance is not None:
+        try:
+            provenance = dict(provenance)
+        except Exception:
+            provenance = {"raw_provenance_repr": repr(provenance)}
+        source_path = str(provenance.get("warmstart_source_path") or "")
+        try:
+            save_root = str(path.parent.resolve())
+        except Exception:
+            save_root = str(path.parent)
+        if not source_path:
+            warmstart_kind = "from_scratch"
+        else:
+            source_abs = os.path.abspath(source_path)
+            save_abs = os.path.abspath(save_root)
+            master_marker = f"{os.sep}agillm4_v100_master_ckpts{os.sep}"
+            if master_marker in source_abs:
+                warmstart_kind = "warmstarted_from_master"
+            elif source_abs.startswith(save_abs + os.sep):
+                warmstart_kind = "warmstarted_from_lane_checkpoint"
+            else:
+                warmstart_kind = "warmstarted_from_non_master_checkpoint"
+        provenance["checkpoint_path"] = str(path)
+        provenance["warmstart_kind"] = warmstart_kind
+        provenance["created_from_scratch"] = warmstart_kind == "from_scratch"
+        provenance["source_is_master_checkpoint"] = warmstart_kind == "warmstarted_from_master"
+        provenance["source_is_lane_checkpoint"] = warmstart_kind == "warmstarted_from_lane_checkpoint"
+        provenance["source_is_non_master_checkpoint"] = warmstart_kind == "warmstarted_from_non_master_checkpoint"
+        state["agillm43_provenance"] = provenance
+        state["agillm43_warmstart_kind"] = warmstart_kind
+        state["agillm43_warmstart_source_path"] = source_path
+        state["agillm43_checkpoint_summary"] = f"{warmstart_kind}; source={source_path or 'none'}; path={path}"
     info = _agillm43_save_pt(state, tmp, codec=ckpt_codec, zstd_level=1)
     tmp.replace(path)
     _write_tokenizer_sidecar(path, {k: state.get(k) for k in ("tokenizer_payload_schema", "tokenizer_id", "tokenizer_json", "tokenizer_bundle", "tokenizer_special", "transformers_version", "tokenizers_version") if state.get(k) is not None})
+    if provenance is not None:
+        try:
+            globals().get("_agillm_provenance").write_sidecar(path, provenance)
+        except Exception as exc:
+            print(f"[provenance] WARNING: failed to write sidecar for {path}: {exc}")
     latest_payload = {"path": str(path), "step": meta["step"]}
+    if provenance is not None:
+        latest_payload["agillm43_provenance"] = provenance
+        latest_payload["warmstart_kind"] = provenance.get("warmstart_kind")
+        latest_payload["warmstart_source_path"] = provenance.get("warmstart_source_path", "")
+        latest_payload["checkpoint_summary"] = state.get("agillm43_checkpoint_summary")
     if meta.get("dataset_provenance"):
         latest_payload["dataset_provenance"] = meta.get("dataset_provenance")
         latest_payload["source_effective"] = meta.get("dataset_provenance", {}).get("source_effective", "")
@@ -6163,7 +6335,9 @@ def _train_phase(
     max_ckpts: int,
     target_tokens_override: Optional[int] = None,
     tie_weights: bool = False,
-    streaming: bool = True
+    streaming: bool = True,
+    lineage: Optional[Dict[str, Any]] = None,
+    provenance_cache: Optional[Dict[str, Any]] = None
 ):
     BLOCK = block_size
     BATCH_REQUESTED = int(batch_size)
@@ -6175,6 +6349,8 @@ def _train_phase(
     oom_good_steps = 0
     if _oom_backoff_enabled(args):
         BATCH, oom_state, oom_state_path, oom_key, oom_signature = _oom_backoff_start(args, phase_name, BLOCK, BATCH)
+    if lineage is None:
+        lineage = {}
     if target_tokens_override is not None:
         target_tokens = target_tokens_override
     else:
@@ -6309,6 +6485,7 @@ def _train_phase(
         try:
             if getattr(args, "dblock", False):
                 loss_value = _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, _DBS)
+                _prov_loss = float(loss_value)
             else:
                 with amp(args.amp):
                     h_ar = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)))
@@ -6377,6 +6554,7 @@ def _train_phase(
                         loss_nat = loss_nat + _aux.to(loss_nat.dtype)
                     scaler.scale(loss_nat).backward()
                     del nat_ids, nat_in, mask, h_nat, logits_nat, loss_nat
+                _prov_loss = float(loss_value)
                 scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_([p for group in opt.param_groups for p in group["params"]], 1.0)
                 scaler.step(opt)
@@ -6499,6 +6677,15 @@ def _train_phase(
                     "device": str(DEV),
                     "save_dir": str(args.save_dir),
                     "dataset_provenance": dataset_meta,
+                    "warmstart": lineage,
+                    "warmstart_source_path": lineage.get("source_path", ""),
+                    "warmstart_kind": lineage.get("warmstart_kind", ""),
+                    "warmstart_base_step": int(lineage.get("warmstart_base_step", 0) or 0),
+                    "global_origin_step": int(lineage.get("global_origin_step", 0) or 0),
+                    "effective_global_step": int((int(lineage.get("global_origin_step", 0) or 0) + int(step)) if int(lineage.get("global_origin_step", 0) or 0) > 0 else int(step)),
+                    "warmstart_base_seen_tok": int(lineage.get("warmstart_base_seen_tok", 0) or 0),
+                    "global_origin_seen_tok": int(lineage.get("global_origin_seen_tok", 0) or 0),
+                    "effective_seen_tok": int(int(lineage.get("global_origin_seen_tok", 0) or 0) + int(seen_tok)),
                     "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
                 if DEV.type == "cuda":
@@ -6552,9 +6739,18 @@ def _train_phase(
             _flush_delta()
             _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-flush-save")
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
+            _prov = _agillm_provenance.collect(args,
+                step=step, seen_tok=seen_tok, loss=_prov_loss,
+                batch_size=BATCH_REQUESTED, block_size=BLOCK,
+                warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+                warmstart_source_provenance=provenance_cache,
+                dataset_provenance=dataset_meta, lane=phase_name or "",
+                _sample_core=core, _sample_ar=ar_h, _sample_sat=sat_h,
+                _sample_tok=tok, _sample_device=DEV)
             save_ckpt(pathlib.Path(args.save_dir) / _ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
                       meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights, "dataset_provenance": dataset_meta},
-                      codec=getattr(args, "ckpt_codec", "zstd3"))
+                      codec=getattr(args, "ckpt_codec", "zstd3"),
+                      provenance=_prov)
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
             last_save_mono = time.monotonic()
             _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
@@ -6571,9 +6767,18 @@ def _train_phase(
                 _flush_delta()  # wait for any in-flight delta before full save
                 _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-save")
                 _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
+                _prov = _agillm_provenance.collect(args,
+                    step=step, seen_tok=seen_tok, loss=_prov_loss,
+                    batch_size=BATCH_REQUESTED, block_size=BLOCK,
+                    warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+                    warmstart_source_provenance=provenance_cache,
+                    dataset_provenance=dataset_meta, lane=phase_name or "",
+                _sample_core=core, _sample_ar=ar_h, _sample_sat=sat_h,
+                _sample_tok=tok, _sample_device=DEV)
                 save_ckpt(pathlib.Path(args.save_dir) / ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
                           meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights, "dataset_provenance": dataset_meta},
-                          codec=getattr(args, "ckpt_codec", "zstd3"))
+                          codec=getattr(args, "ckpt_codec", "zstd3"),
+                          provenance=_prov)
                 _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
                 last_save_mono = now_mono
                 # Prune old deltas after a full save (they're superseded)
@@ -6598,7 +6803,14 @@ def _train_phase(
             if args.delta_max_keep and args.delta_max_keep > 0:
                 _flush_delta()
                 _prune_delta_files_to_count(save_root, phase_name, args.delta_max_keep - 1)
-            save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"))
+            _delta_prov = _agillm_provenance.collect(args,
+                step=step, seen_tok=seen_tok, loss=_prov_loss,
+                batch_size=BATCH_REQUESTED, block_size=BLOCK,
+                warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+                warmstart_source_provenance=provenance_cache,
+                dataset_provenance=dataset_meta, lane=phase_name or "",
+                checkpoint_type="delta")
+            save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"), provenance=_delta_prov)
             last_delta_step = step
             last_delta_mono = now_mono
         if args.auto_grow:
@@ -6616,9 +6828,18 @@ def _train_phase(
     pbar.close()
     _flush_delta()  # ensure any in-flight delta completes before final save
     if phase_name != "sft":
+        _prov = _agillm_provenance.collect(args,
+            step=step, seen_tok=seen_tok, loss=_prov_loss,
+            batch_size=BATCH_REQUESTED, block_size=BLOCK,
+            warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+            warmstart_source_provenance=provenance_cache,
+            dataset_provenance=dataset_meta, lane=phase_name or "",
+                _sample_core=core, _sample_ar=ar_h, _sample_sat=sat_h,
+                _sample_tok=tok, _sample_device=DEV)
         save_ckpt(pathlib.Path(args.save_dir) / f"{phase_name}_final.pt", core, ar_h, sat_h, nat_h, opt, scaler,
                   meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights, "dataset_provenance": dataset_meta},
-                  codec=getattr(args, "ckpt_codec", "zstd3"))
+                  codec=getattr(args, "ckpt_codec", "zstd3"),
+                  provenance=_prov)
     else:
         print("[sft] Skipping duplicate sft_final.pt; final.pt will contain the SFT result.")
     return step, seen_tok, time.time()
@@ -6706,6 +6927,8 @@ def train(args):
     if tie_weights:
         head_names = "AR/SAT/NAT" if nat_h is not None else "AR/SAT"
         print(f"{Colors.WARN}[weight-tying] Embedding and {head_names} vocab projections share one tensor (VRAM-first){Colors.RESET}")
+    _agillm_provenance_cache = None
+    _agillm_loaded_source_path = ""
     if not args.fresh:
         src = pathlib.Path(args.warmstart_from) if args.warmstart_from else pathlib.Path(args.save_dir) / "final.pt"
         src = _resolve_ckpt(src)
@@ -6716,7 +6939,21 @@ def train(args):
             nat_loaded = _safe_load_any(src, nat_h, key="nat") if nat_h is not None else 0
             if nat_h is not None and not nat_loaded:
                 print("[nat] Warm-start source has no NAT head; NAT head initialized fresh")
-            if loaded: print(f"Warm-start loaded from {src}")
+            if loaded:
+                print(f"Warm-start loaded from {src}")
+                _agillm_loaded_source_path = str(src)
+                _agillm_provenance_cache = _agillm_provenance.extract(src)
+            else:
+                _agillm_provenance_cache = None
+    if not _agillm_loaded_source_path and (getattr(args, "warmstart_from", None) or getattr(args, "resume", None)):
+        _agillm_loaded_source_path = str(getattr(args, "warmstart_from", None) or getattr(args, "resume", None))
+    _agillm_lineage = _agillm43_lineage_info(_agillm_loaded_source_path, _agillm_provenance_cache, args.save_dir)
+    print(
+        f"[lineage] warmstart_kind={_agillm_lineage.get('warmstart_kind')} "
+        f"source={_agillm_lineage.get('source_path') or 'none'} "
+        f"origin_step={_agillm_lineage.get('global_origin_step', 0)}",
+        flush=True,
+    )
     _phase_freeze(core, freeze_core=args.freeze_core, unfreeze_ln=args.unfreeze_ln, train_emb=args.train_emb)
     opt = make_optimizer(args, core, ar_h, sat_h, args.lr_core, args.lr_head, nat_h)
     scaler = GradScaler(enabled=(args.amp and _needs_grad_scaler()))
@@ -6765,7 +7002,9 @@ def train(args):
         chat_cfg={"chat": args.chat, "key": args.chat_messages_key, "gen_prompt": args.sft_add_generation_prompt, "text_field": args.dataset_field_text},
         max_ckpts=args.max_ckpts,
         target_tokens_override=args.target_tokens,
-        tie_weights=tie_weights
+        tie_weights=tie_weights,
+        lineage=_agillm_lineage,
+        provenance_cache=_agillm_provenance_cache
     )
     if (not args.after_sft_source) and (args.after_sft_steps and args.after_sft_steps > 0):
         args.after_sft_source = DEFAULT_AFTER_SFT_SOURCES
@@ -6802,13 +7041,24 @@ def train(args):
             max_ckpts=args.max_ckpts,
             target_tokens_override=None,
             tie_weights=tie_weights,
-            streaming=True
+            streaming=True,
+            lineage=_agillm_lineage,
+            provenance_cache=_agillm_provenance_cache
         )
     final_effective_source = get_hot_datasets(args.source)
     final_dataset_meta = _dataset_provenance("final", args.source, final_effective_source, args)
+    _prov = _agillm_provenance.collect(args,
+        step=step, seen_tok=seen_tok, loss=_prov_loss,
+        batch_size=BATCH_REQUESTED, block_size=BLOCK,
+        warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+        warmstart_source_provenance=_agillm_provenance_cache,
+        dataset_provenance=final_dataset_meta, lane=phase_name or "",
+                _sample_core=core, _sample_ar=ar_h, _sample_sat=sat_h,
+                _sample_tok=tok, _sample_device=DEV)
     save_ckpt(pathlib.Path(args.save_dir) / "final.pt", core, ar_h, sat_h, nat_h, opt, scaler,
               meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights, "dataset_provenance": final_dataset_meta},
-              codec=getattr(args, "ckpt_codec", "zstd3"))
+              codec=getattr(args, "ckpt_codec", "zstd3"),
+              provenance=_prov)
     print("🎉 All Training Complete")
 
 

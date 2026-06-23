@@ -2220,17 +2220,35 @@ def _augment_numeracy_only_sources(default_sources: str) -> str:
 
 
 def get_hot_datasets(default_sources: str) -> str:
-    """Merge hot_config datasets into the safe default mix instead of replacing it."""
+    """Merge hot_config datasets and launch arguments into the innate hardcoded defaults."""
     cfg = get_hot_config()
-    sources = _augment_numeracy_only_sources(default_sources)
+    
+    # 1. Start with innate hardcoded defaults unless explicitly disabled
+    disable_defaults = cfg.get("disable_default_datasets", False) or str(os.environ.get("AGILLM_DISABLE_DEFAULT_DATASETS", "")).lower() in {"1", "true", "yes"}
+    if disable_defaults:
+        sources = ""
+    else:
+        sources = globals().get("DEFAULT_PRETRAIN_SOURCES", "")
+        
+    # 2. Merge launch arguments
+    if default_sources and default_sources != globals().get("DEFAULT_PRETRAIN_SOURCES", ""):
+        sources = _dataset_merge_csv(sources, default_sources)
+        
+    # 3. Augment if needed for numeracy
+    sources = _augment_numeracy_only_sources(sources)
+
+    # 4. Merge hot_config datasets
     hot_ds = _dataset_config_to_csv(cfg.get("datasets"))
     if hot_ds:
         sources = _dataset_merge_csv(sources, hot_ds)
         print(f"[hot_config] Merged datasets into default mix: {hot_ds}", flush=True)
+
+    # 5. Appended datasets
     append_ds = _dataset_config_to_csv(cfg.get("datasets_append") or cfg.get("extra_datasets"))
     if append_ds:
         sources = _dataset_merge_csv(sources, append_ds)
         print(f"[hot_config] Appended datasets: {append_ds}", flush=True)
+
     return sources
 
 
@@ -2638,8 +2656,8 @@ DEFAULT_BATCH = 4
 SAT_BLOCK = 2
 LR_CORE, LR_HEAD = 5e-5, 2e-4
 EMIT_LAMBDA = 0.1
-DEFAULT_SAVE_SEC = 24 * 3600
-DEFAULT_DELTA_STEPS = 100000     # lightweight weight-only save every N steps
+DEFAULT_SAVE_SEC = 12 * 3600
+DEFAULT_DELTA_SEC = 1800         # lightweight weight-only save every N seconds
 DEFAULT_MAX_DELTAS = 5         # keep last N deltas (older pruned after full save)
 CKDIR = pathlib.Path("ckpts_expansion")
 
@@ -5524,6 +5542,55 @@ def _side_update_move(path: pathlib.Path, directory: pathlib.Path) -> pathlib.Pa
         shutil.move(str(path), str(dest))
     return dest
 
+def _push_async_side_update(core: nn.Module, cfg: dict, args, step: int):
+    import os, time, urllib.request, io, json, torch
+    server_url = os.environ.get("AGILLM_SYNC_SERVER", "http://5.75.217.57:9090")
+    if not server_url:
+        return
+    try:
+        if not hasattr(core, '_sparse_baseline'):
+            core._sparse_baseline = {k: v.detach().cpu().clone() for k, v in core.named_parameters() if v.requires_grad}
+            return
+        
+        delta = {}
+        changed = 0
+        for k, v in core.named_parameters():
+            if not v.requires_grad: continue
+            base = core._sparse_baseline[k]
+            current = v.detach().cpu()
+            diff = current - base
+            
+            k_val = max(1, int(diff.numel() * 0.05))
+            if k_val < diff.numel():
+                val, idx = torch.topk(diff.abs().flatten(), k_val)
+                sparse_vals = diff.flatten()[idx]
+                delta[k] = {"idx": idx, "val": sparse_vals, "shape": diff.shape}
+            else:
+                delta[k] = diff
+                
+            base.copy_(current)
+            changed += 1
+
+        payload = {
+            "kind": "agillm43_sparse_update",
+            "worker_id": os.environ.get("AGILLM_WORKER_ID", "unknown"),
+            "step": step,
+            "cfg": cfg,
+            "sparse_delta": delta
+        }
+        
+        buf = io.BytesIO()
+        torch.save(payload, buf)
+        req = urllib.request.Request(
+            f"{server_url}/push",
+            data=buf.getvalue(),
+            headers={'Content-Length': str(len(buf.getvalue()))}
+        )
+        urllib.request.urlopen(req, timeout=10)
+        print(json.dumps({"event": "async_side_update_pushed", "step": step, "keys": changed}), flush=True)
+    except Exception as e:
+        print(json.dumps({"event": "async_side_update_push_failed", "step": step, "error": str(e)}), flush=True)
+
 def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> list[dict]:
     update_dir_s = str(getattr(args, "async_update_dir", "") or "").strip()
     alpha = float(getattr(args, "async_update_alpha", 1.0) or 0.0)
@@ -5540,56 +5607,121 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
     buffer_map = dict(core.named_buffers())
     now = time.time()
     applied: list[dict] = []
-    candidates = sorted(
-        [p for p in update_dir.glob("*.pt") if p.is_file() and not p.name.endswith(".tmp")],
-        key=lambda p: p.stat().st_mtime,
-    )
-    for path in candidates[:max_updates]:
+    
+    server_url = os.environ.get("AGILLM_SYNC_SERVER", "http://5.75.217.57:9090")
+    if server_url:
+        import urllib.request, io
+        try:
+            req = urllib.request.Request(f"{server_url}/pull")
+            resp = urllib.request.urlopen(req, timeout=10)
+            data = resp.read()
+            if not data:
+                return []
+            path = pathlib.Path("http_pull.pt")
+            upd = torch.load(io.BytesIO(data), map_location="cpu")
+        except Exception as e:
+            print(json.dumps({"event": "async_side_update_pull_failed", "step": step, "error": str(e)}), flush=True)
+            return []
+        candidates = [(path, upd)]
+    else:
+        file_candidates = sorted(
+            [p for p in update_dir.glob("*.pt") if p.is_file() and not p.name.endswith(".tmp")],
+            key=lambda p: p.stat().st_mtime,
+        )
+        candidates = []
+        for p in file_candidates[:max_updates]:
+            if max_age > 0 and now - p.stat().st_mtime > max_age:
+                print(json.dumps({"event": "async_side_update_rejected", "step": step, "path": str(p), "error": "stale"}), flush=True)
+                try: _side_update_move(p, rejected_dir)
+                except: pass
+                continue
+            try:
+                candidates.append((p, _agillm43_load_pt(p, map_location="cpu", weights_only=False)))
+            except Exception as e:
+                try: _side_update_move(p, rejected_dir)
+                except: pass
+
+    for path, upd in candidates:
         reject_reason = ""
         try:
-            if max_age > 0 and now - path.stat().st_mtime > max_age:
-                reject_reason = f"stale update older than {max_age:g}s"
-                raise ValueError(reject_reason)
-            upd = _agillm43_load_pt(path, map_location="cpu", weights_only=False)
             kind = upd.get("kind")
-            if kind not in {"agillm35_dblock_slice_update", "agillm4_dblock_slice_update", "agillm41_dblock_slice_update"}:
+            if kind not in {"agillm35_dblock_slice_update", "agillm4_dblock_slice_update", "agillm41_dblock_slice_update", "agillm43_sparse_update"}:
                 raise ValueError(f"bad update kind {kind!r}")
             if dict(upd.get("cfg", {})) != dict(cfg):
                 raise ValueError("cfg mismatch")
-            update_mode = "state_lerp"
-            block_state = upd.get("block_state")
-            block_delta_state = upd.get("block_delta_state")
-            if block_delta_state is not None:
-                update_mode = "delta_add"
-                block_codec = _agillm43_tensor_state_summary(block_delta_state)
-                block_state = _agillm43_decode_tensor_state(block_delta_state)
+            # Handle sparse and dense payload states
+            if kind == "agillm43_sparse_update":
+                sparse_delta = upd.get("sparse_delta", {})
+                changed = 0
+                device = next(core.parameters()).device if list(core.parameters()) else torch.device('cpu')
+                stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
+                ctx = torch.cuda.stream(stream) if stream else torch.no_grad()
+                with torch.no_grad(), ctx:
+                    for key, s in sparse_delta.items():
+                        target = param_map.get(key)
+                        if target is None:
+                            target = buffer_map.get(key)
+                        if target is None:
+                            continue
+                        if isinstance(s, dict) and "idx" in s: # Sparse Top-K
+                            idx = s["idx"].to(target.device)
+                            val = s["val"].to(target.device, dtype=target.dtype)
+                            flat_target = target.view(-1)
+                            # add the sparse delta * alpha
+                            flat_target.scatter_add_(0, idx, val * alpha)
+                        else: # Dense
+                            src = s.to(target.device, dtype=target.dtype)
+                            target.add_(src, alpha=alpha)
+                        changed += 1
+                if stream:
+                    stream.synchronize()
+                update_mode = "sparse_add"
+                block_codec = "sparse"
             else:
-                block_codec = _agillm43_tensor_state_summary(block_state)
-                block_state = _agillm43_decode_tensor_state(block_state)
-            if not isinstance(block_state, dict) or not block_state:
-                raise ValueError("missing block_state or block_delta_state")
-            changed = 0
-            with torch.no_grad():
-                for key, value in block_state.items():
-                    target = param_map.get(key)
-                    if target is None:
-                        target = buffer_map.get(key)
-                    if target is None:
-                        raise KeyError(f"unknown core key {key}")
-                    if tuple(value.shape) != tuple(target.shape):
-                        raise ValueError(f"{key} shape mismatch update={tuple(value.shape)} target={tuple(target.shape)}")
-                    src = value.to(device=target.device, dtype=target.dtype, non_blocking=True)
-                    if update_mode == "delta_add":
-                        if not target.is_floating_point():
-                            raise ValueError(f"{key} delta update targets non-floating tensor")
-                        target.add_(src, alpha=alpha)
-                    elif alpha >= 1.0:
-                        target.copy_(src)
-                    else:
-                        target.lerp_(src, alpha)
-                    changed += 1
-                    del src
-            dest = _side_update_move(path, accepted_dir)
+                update_mode = "state_lerp"
+                block_state = upd.get("block_state")
+                block_delta_state = upd.get("block_delta_state")
+                if block_delta_state is not None:
+                    update_mode = "delta_add"
+                    block_codec = _agillm43_tensor_state_summary(block_delta_state)
+                    block_state = _agillm43_decode_tensor_state(block_delta_state)
+                else:
+                    block_codec = _agillm43_tensor_state_summary(block_state)
+                    block_state = _agillm43_decode_tensor_state(block_state)
+                if not isinstance(block_state, dict) or not block_state:
+                    raise ValueError("missing block_state or block_delta_state")
+                changed = 0
+                # Use a separate CUDA stream to prevent blocking the main training loop
+                device = next(core.parameters()).device if list(core.parameters()) else torch.device('cpu')
+                stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
+                ctx = torch.cuda.stream(stream) if stream else torch.no_grad()
+                with torch.no_grad(), ctx:
+                    for key, value in block_state.items():
+                        target = param_map.get(key)
+                        if target is None:
+                            target = buffer_map.get(key)
+                        if target is None:
+                            raise KeyError(f"unknown core key {key}")
+                        if tuple(value.shape) != tuple(target.shape):
+                            raise ValueError(f"{key} shape mismatch update={tuple(value.shape)} target={tuple(target.shape)}")
+                        src = value.to(device=target.device, dtype=target.dtype, non_blocking=True)
+                        if update_mode == "delta_add":
+                            if not target.is_floating_point():
+                                raise ValueError(f"{key} delta update targets non-floating tensor")
+                            target.add_(src, alpha=alpha)
+                        elif alpha >= 1.0:
+                            target.copy_(src)
+                        else:
+                            target.lerp_(src, alpha)
+                        changed += 1
+                        del src
+                if stream:
+                    stream.synchronize()
+            
+            if str(path) != "http_pull.pt":
+                dest = _side_update_move(path, accepted_dir)
+            else:
+                dest = path
             rec = {
                 "path": str(dest),
                 "worker_id": upd.get("worker_id"),
@@ -5605,9 +5737,12 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
             applied.append(rec)
             print(json.dumps({"event": "async_side_update_applied", "step": step, **rec}), flush=True)
         except Exception as exc:
-            try:
-                dest = _side_update_move(path, rejected_dir)
-            except Exception:
+            if str(path) != "http_pull.pt":
+                try:
+                    dest = _side_update_move(path, rejected_dir)
+                except Exception:
+                    dest = path
+            else:
                 dest = path
             print(
                 json.dumps(
@@ -6330,7 +6465,9 @@ def _train_phase(
         pbar.update(toks_processed)
         async_every = int(getattr(args, "async_update_every_steps", 0) or 0)
         if async_every > 0 and (step % async_every) == 0:
-            _apply_async_side_updates(core, cfg, args, step)
+            import threading
+            threading.Thread(target=_apply_async_side_updates, args=(core, cfg, args, step), daemon=True).start()
+            threading.Thread(target=_push_async_side_update, args=(core, cfg, args, step), daemon=True).start()
         empty_cache_every = int(getattr(args, "empty_cache_every_steps", 0) or 0)
         if DEV.type == "cuda" and empty_cache_every > 0 and (step % empty_cache_every) == 0:
             try:
@@ -6432,7 +6569,7 @@ def _train_phase(
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
             last_save_mono = time.monotonic()
             _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
-            last_delta_step = step
+            last_delta_mono = time.monotonic()
             print(f"[{phase_name}] ON-DEMAND flush saved {_ck_name} at step {step}")
         if args.save_every_sec > 0:
             now_mono = time.monotonic()
@@ -6448,9 +6585,9 @@ def _train_phase(
                 last_save_mono = now_mono
                 # Prune old deltas after a full save (they're superseded)
                 _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
-                last_delta_step = step  # reset delta counter after full save
-        # ── Delta checkpoint (step-based, weight-only, async) ──
-        if args.delta_every_steps > 0 and (step - last_delta_step) >= args.delta_every_steps:
+                last_delta_mono = now_mono  # reset delta counter after full save
+        # ── Delta checkpoint (time-based, weight-only, async) ──
+        if args.delta_every_sec > 0 and (time.monotonic() - last_delta_mono) >= args.delta_every_sec:
             save_root = pathlib.Path(args.save_dir)
             # AGILLM4 production runs on small rented disks. When keep=1, prune
             # old deltas before the async writer creates the next multi-GB file.
@@ -6458,7 +6595,7 @@ def _train_phase(
                 _flush_delta()
                 _prune_delta_files_to_count(save_root, phase_name, args.delta_max_keep - 1)
             save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"))
-            last_delta_step = step
+            last_delta_mono = time.monotonic()
         if args.auto_grow:
             steps_since_last_grow += 1
             if steps_since_last_grow >= args.grow_every_steps:
@@ -7758,7 +7895,7 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
         "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
         "--save_dir", str(save_dir), "--save_every_sec", prof.get("save_every_sec", "14400"), "--heartbeat_every_sec", "300",
-        "--empty_cache_every_steps", "0", "--delta_every_steps", "25000", "--delta_max_keep", "1", "--max_ckpts", "1",
+        "--empty_cache_every_steps", "0", "--delta_every_sec", "1800", "--delta_max_keep", "1", "--max_ckpts", "1",
         "--async_update_dir", incoming, "--async_update_every_steps", "100", "--async_update_alpha", "0.05",
         "--async_update_max_per_check", "2", "--async_update_max_age_sec", "86400",
         "--async_update_accepted_dir", accepted, "--async_update_rejected_dir", rejected,
@@ -8004,7 +8141,7 @@ def main():
                     help="Profile the first N DBlock training steps with in-process CUDA timers; 0 disables.")
     tr.add_argument("--profile_log_every", type=int, default=25,
                     help="Print averaged profiler timings every N profiled steps.")
-    tr.add_argument("--delta_every_steps", type=int, default=DEFAULT_DELTA_STEPS, help="Weight-only delta save every N steps (0=off)")
+    tr.add_argument("--delta_every_sec", type=int, default=DEFAULT_DELTA_SEC, help="Weight-only delta save every N seconds (0=off)")
     tr.add_argument("--delta_max_keep", type=int, default=DEFAULT_MAX_DELTAS, help="Max delta checkpoints to keep")
     tr.add_argument("--delta_codec", default=os.environ.get("AGILLM43_DELTA_CODEC", "zstd3"),
                     help="Delta checkpoint payload codec: off/raw, zstd, or zstdN such as zstd3. zstd modes are lossless and accepted by load_delta.")

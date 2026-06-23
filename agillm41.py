@@ -2121,7 +2121,7 @@ from transformers import AutoTokenizer, logging as hf_log
 HOT_CONFIG_PATH = Path(os.environ.get("AGILLM_HOT_CONFIG") or os.environ.get("AGILLM_HOT_CONFIG_PATH") or "/workspace/hot_config.json")
 DEFAULT_LANGUAGE_PRETRAIN_SOURCES = os.environ.get(
     "AGILLM_DEFAULT_LANGUAGE_PRETRAIN_SOURCES",
-    "HuggingFaceFW/fineweb,wikimedia/wikipedia:20231101.en,allenai/c4:en,EleutherAI/proof-pile-2",
+    "HuggingFaceFW/fineweb,HuggingFaceFW/fineweb-edu:sample-10BT,wikimedia/wikipedia:20231101.en,allenai/c4:en,Skylion007/openwebtext,tiiuae/falcon-refinedweb,EleutherAI/proof-pile-2,allenai/dolma:v1_6-sample",
 )
 _hot_config_cache = {"mtime": 0, "data": {}}
 
@@ -2201,54 +2201,26 @@ def _augment_numeracy_only_sources(default_sources: str) -> str:
     language_sources = _language_pretrain_fallback_sources()
     if not language_sources:
         return default_sources
-    try:
-        numeracy_weight = float(os.environ.get("AGILLM_NUMERACY_FALLBACK_WEIGHT", "0.20") or 0.20)
-    except Exception:
-        numeracy_weight = 0.20
-    numeracy_weight = max(0.0, min(numeracy_weight, 1.0))
-    numeracy_specs = []
-    for spec in _dataset_specs_csv(default_sources):
-        base = _dataset_spec_without_weight(spec)
-        numeracy_specs.append(f"{base}|{numeracy_weight:g}")
-    merged = _dataset_merge_csv(language_sources, ",".join(numeracy_specs))
     print(
-        f"[dataset-policy] numeracy-only source expanded with built-in language pretrain mix; "
-        f"numeracy_weight={numeracy_weight:g}",
+        "[dataset-policy] numeracy-only pretrain source replaced with built-in language pretrain mix; "
+        "numeracy_weight=0",
         flush=True,
     )
-    return merged
+    return language_sources
 
 
 def get_hot_datasets(default_sources: str) -> str:
-    """Merge hot_config datasets and launch arguments into the innate hardcoded defaults."""
+    """Merge hot_config datasets into the safe default mix instead of replacing it."""
     cfg = get_hot_config()
-    
-    # 1. Start with innate hardcoded defaults unless explicitly disabled
-    disable_defaults = cfg.get("disable_default_datasets", False) or str(os.environ.get("AGILLM_DISABLE_DEFAULT_DATASETS", "")).lower() in {"1", "true", "yes"}
-    if disable_defaults:
-        sources = ""
-    else:
-        sources = globals().get("DEFAULT_PRETRAIN_SOURCES", "")
-        
-    # 2. Merge launch arguments
-    if default_sources and default_sources != globals().get("DEFAULT_PRETRAIN_SOURCES", ""):
-        sources = _dataset_merge_csv(sources, default_sources)
-        
-    # 3. Augment if needed for numeracy
-    sources = _augment_numeracy_only_sources(sources)
-
-    # 4. Merge hot_config datasets
+    sources = _augment_numeracy_only_sources(default_sources)
     hot_ds = _dataset_config_to_csv(cfg.get("datasets"))
     if hot_ds:
         sources = _dataset_merge_csv(sources, hot_ds)
         print(f"[hot_config] Merged datasets into default mix: {hot_ds}", flush=True)
-
-    # 5. Appended datasets
     append_ds = _dataset_config_to_csv(cfg.get("datasets_append") or cfg.get("extra_datasets"))
     if append_ds:
         sources = _dataset_merge_csv(sources, append_ds)
         print(f"[hot_config] Appended datasets: {append_ds}", flush=True)
-
     return sources
 
 
@@ -2656,8 +2628,9 @@ DEFAULT_BATCH = 4
 SAT_BLOCK = 2
 LR_CORE, LR_HEAD = 5e-5, 2e-4
 EMIT_LAMBDA = 0.1
-DEFAULT_SAVE_SEC = 12 * 3600
-DEFAULT_DELTA_SEC = 1800         # lightweight weight-only save every N seconds
+DEFAULT_SAVE_SEC = 24 * 3600
+DEFAULT_DELTA_STEPS = 0          # step-triggered delta saves disabled; use DEFAULT_DELTA_SEC
+DEFAULT_DELTA_SEC = int(os.environ.get("AGILLM43_DELTA_EVERY_SEC", "3600"))  # lightweight weight-only save every N seconds
 DEFAULT_MAX_DELTAS = 5         # keep last N deltas (older pruned after full save)
 CKDIR = pathlib.Path("ckpts_expansion")
 
@@ -2884,13 +2857,134 @@ def _parse_dataset_ref(ds_name: str):
         base, config = ref, None
     return base, config, split
 
+_DATASET_COMPAT_RULES = [
+    # Keep dataset-specific scars in one place. These are name-pattern fixes for
+    # repos whose HF auto-builder, schema, or default config is known to bite
+    # streaming pretraining.
+    (re.compile(r"^EleutherAI/proof-pile-2$"), {"loader": "proof_pile_direct"}),
+    (re.compile(r"^allenai/dolma$"), {"loader": "dolma_url_manifest", "default_config": "v1_6-sample"}),
+    (re.compile(r"^tiiuae/falcon-refinedweb$"), {"text_fields": ("content", "text")}),
+    (re.compile(r"^HuggingFaceFW/fineweb-edu$"), {"default_config": "sample-10BT"}),
+    (re.compile(r"^Salesforce/wikitext$"), {"default_config": "wikitext-103-raw-v1"}),
+]
+
+def _dataset_compat(base: str) -> dict:
+    for pattern, rule in _DATASET_COMPAT_RULES:
+        try:
+            if pattern.match(base or ""):
+                return rule
+        except Exception:
+            continue
+    return {}
+
+def _dataset_text_fields_for_source(ds_name: str, preferred: str = "text") -> List[str]:
+    base, _config, _split = _parse_dataset_ref(ds_name)
+    compat = _dataset_compat(base)
+    fields = []
+
+    def add(field):
+        if isinstance(field, str) and field and field not in fields:
+            fields.append(field)
+
+    add(preferred)
+    for field in compat.get("text_fields", ()): add(field)
+    for field in ("text", "content", "raw_content", "document", "body"):
+        add(field)
+    return fields
+
+_PROOF_PILE_REPO = "EleutherAI/proof-pile-2"
+_PROOF_PILE_URL_BASE = f"https://huggingface.co/datasets/{_PROOF_PILE_REPO}/resolve/main/"
+_PROOF_PILE_FILE_CACHE = {}
+
+_DOLMA_REPO = "allenai/dolma"
+_DOLMA_FILE_CACHE = {}
+
+def _dolma_data_files(config: Optional[str], split: str) -> List[str]:
+    # The Dolma HF builder can hit UnicodeDecodeError by treating compressed
+    # payload bytes as text. Its repo exposes URL manifests; feed those URLs
+    # to the JSON builder directly instead.
+    subset_ref = (config or os.environ.get("AGILLM_DOLMA_SUBSET", "") or "v1_6-sample").strip()
+    split_ref = (split or "train").strip() or "train"
+    cache_key = (subset_ref, split_ref)
+    cached = _DOLMA_FILE_CACHE.get(cache_key)
+    if cached:
+        return cached
+    if split_ref != "train":
+        raise FileNotFoundError(f"{_DOLMA_REPO} manifest loader only supports train split, got {split_ref!r}")
+    manifest = subset_ref if subset_ref.startswith("urls/") else f"urls/{subset_ref}.txt"
+    try:
+        from huggingface_hub import hf_hub_download
+        manifest_path = hf_hub_download(_DOLMA_REPO, manifest, repo_type="dataset")
+        urls = [line.strip() for line in Path(manifest_path).read_text().splitlines() if line.strip() and not line.startswith("#")]
+    except Exception as exc:
+        raise RuntimeError(f"could not resolve {_DOLMA_REPO} manifest {manifest}: {exc}") from exc
+    if not urls:
+        raise FileNotFoundError(f"empty {_DOLMA_REPO} manifest {manifest}")
+    _DOLMA_FILE_CACHE[cache_key] = urls
+    return urls
+
+def _proof_pile_data_files(config: Optional[str], split: str) -> List[str]:
+    # The HF auto-builder for proof-pile-2 can try to UTF-8 decode compressed
+    # .jsonl.zst bytes. Loading the repo's shards explicitly through the JSON
+    # builder keeps this language source usable while preserving one logical
+    # interleave source.
+    subset_ref = (config or os.environ.get("AGILLM_PROOF_PILE_SUBSET", "") or "all").strip()
+    split_ref = (split or "train").strip() or "train"
+    cache_key = (subset_ref, split_ref)
+    cached = _PROOF_PILE_FILE_CACHE.get(cache_key)
+    if cached:
+        return cached
+    if subset_ref.lower() in {"", "all", "default", "full"}:
+        subsets = ["algebraic-stack", "arxiv", "open-web-math"]
+    else:
+        subsets = [s.strip() for s in re.split(r"[+;]", subset_ref) if s.strip()]
+    try:
+        from huggingface_hub import list_repo_files
+        repo_files = list_repo_files(_PROOF_PILE_REPO, repo_type="dataset")
+    except Exception as exc:
+        raise RuntimeError(f"could not list {_PROOF_PILE_REPO} shards: {exc}") from exc
+    prefixes = tuple(f"{subset}/{split_ref}/" for subset in subsets)
+    shard_paths = sorted(
+        f for f in repo_files
+        if f.endswith(".jsonl.zst") and f.startswith(prefixes)
+    )
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"no {_PROOF_PILE_REPO} .jsonl.zst shards for subset={subset_ref!r} split={split_ref!r}"
+        )
+    urls = [_PROOF_PILE_URL_BASE + f for f in shard_paths]
+    _PROOF_PILE_FILE_CACHE[cache_key] = urls
+    return urls
+
 def _open_stream_one(ds_name: str, seed: int, streaming: bool = True):
     dc = DownloadConfig(max_retries=5, use_etag=True, resume_download=True)
     base, config, split = _parse_dataset_ref(ds_name)
+    compat = _dataset_compat(base)
+    if config is None and compat.get("default_config"):
+        config = str(compat["default_config"])
+        print(f"[dataset-policy] {base} default_config={config}", flush=True)
     if not streaming:
         print(f"[download] Downloading {ds_name} (non-streaming)...")
     if base == "json":
         data_files = {"train": config}
+        ds = load_dataset("json", data_files=data_files, split=split, streaming=streaming, download_config=dc)
+    elif compat.get("loader") == "proof_pile_direct":
+        urls = _proof_pile_data_files(config, split)
+        data_files = {split: urls}
+        subset_ref = config or os.environ.get("AGILLM_PROOF_PILE_SUBSET", "") or "all"
+        print(
+            f"[dataset-policy] proof-pile direct jsonl.zst loader subset={subset_ref} split={split} shards={len(urls)}",
+            flush=True,
+        )
+        ds = load_dataset("json", data_files=data_files, split=split, streaming=streaming, download_config=dc)
+    elif compat.get("loader") == "dolma_url_manifest":
+        urls = _dolma_data_files(config, split)
+        data_files = {split: urls}
+        subset_ref = config or os.environ.get("AGILLM_DOLMA_SUBSET", "") or "v1_6-sample"
+        print(
+            f"[dataset-policy] dolma direct json.gz loader subset={subset_ref} split={split} shards={len(urls)}",
+            flush=True,
+        )
         ds = load_dataset("json", data_files=data_files, split=split, streaming=streaming, download_config=dc)
     else:
         ds = load_dataset(base, config, split=split, streaming=streaming, download_config=dc) if config else \
@@ -3051,6 +3145,7 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
 
     for src in sources:
         _source_state(src)
+    source_text_fields = [_dataset_text_fields_for_source(src, dataset_field_text) for src in sources]
 
     def _router_features(i, now):
         total_w = max(sum(weights), 1e-9)
@@ -3478,10 +3573,10 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                 if chat:
                     text = _render_chat_text_from_ex(ex, chat_messages_key, sft_add_generation_prompt)
                 if text is None:
-                    if dataset_field_text and isinstance(ex.get(dataset_field_text), str):
-                        text = ex[dataset_field_text]
-                    elif isinstance(ex.get("text"), str):
-                        text = ex["text"]
+                    for field in source_text_fields[src_idx]:
+                        if isinstance(ex.get(field), str):
+                            text = ex[field]
+                            break
             if not isinstance(text, str) or not text.strip():
                 _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err="empty_or_missing_text", empty=True)
                 _agent_maybe_advise(src_idx, "empty_or_missing_text")
@@ -5223,9 +5318,18 @@ def _build_val_set(source, chat_cfg, args, block):
     if n <= 0:
         return []
     want = max(1, n // (block + 1)) * (block + 1)
-    val_source = str(getattr(args, "val_source", "") or "").strip()
-    use_hot_config = not bool(val_source)
-    val_source = val_source or source
+    val_source_requested = str(getattr(args, "val_source", "") or "").strip()
+    val_source = val_source_requested
+    if val_source and _looks_numeracy_only_sources(val_source) and not _looks_numeracy_only_sources(source):
+        print(
+            "[dataset-policy] val_source is numeracy-only; using effective language pretrain mix for validation",
+            flush=True,
+        )
+        val_source = source
+        use_hot_config = False
+    else:
+        use_hot_config = not bool(val_source)
+        val_source = val_source or source
     print(
         f"[val] building held-out set from {val_source} "
         f"(hot_config={'on' if use_hot_config else 'off'}, seed {getattr(args, 'val_seed', 1337)})",
@@ -5542,55 +5646,6 @@ def _side_update_move(path: pathlib.Path, directory: pathlib.Path) -> pathlib.Pa
         shutil.move(str(path), str(dest))
     return dest
 
-def _push_async_side_update(core: nn.Module, cfg: dict, args, step: int):
-    import os, time, urllib.request, io, json, torch
-    server_url = os.environ.get("AGILLM_SYNC_SERVER", "http://5.75.217.57:9090")
-    if not server_url:
-        return
-    try:
-        if not hasattr(core, '_sparse_baseline'):
-            core._sparse_baseline = {k: v.detach().cpu().clone() for k, v in core.named_parameters() if v.requires_grad}
-            return
-        
-        delta = {}
-        changed = 0
-        for k, v in core.named_parameters():
-            if not v.requires_grad: continue
-            base = core._sparse_baseline[k]
-            current = v.detach().cpu()
-            diff = current - base
-            
-            k_val = max(1, int(diff.numel() * 0.05))
-            if k_val < diff.numel():
-                val, idx = torch.topk(diff.abs().flatten(), k_val)
-                sparse_vals = diff.flatten()[idx]
-                delta[k] = {"idx": idx, "val": sparse_vals, "shape": diff.shape}
-            else:
-                delta[k] = diff
-                
-            base.copy_(current)
-            changed += 1
-
-        payload = {
-            "kind": "agillm43_sparse_update",
-            "worker_id": os.environ.get("AGILLM_WORKER_ID", "unknown"),
-            "step": step,
-            "cfg": cfg,
-            "sparse_delta": delta
-        }
-        
-        buf = io.BytesIO()
-        torch.save(payload, buf)
-        req = urllib.request.Request(
-            f"{server_url}/push",
-            data=buf.getvalue(),
-            headers={'Content-Length': str(len(buf.getvalue()))}
-        )
-        urllib.request.urlopen(req, timeout=10)
-        print(json.dumps({"event": "async_side_update_pushed", "step": step, "keys": changed}), flush=True)
-    except Exception as e:
-        print(json.dumps({"event": "async_side_update_push_failed", "step": step, "error": str(e)}), flush=True)
-
 def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> list[dict]:
     update_dir_s = str(getattr(args, "async_update_dir", "") or "").strip()
     alpha = float(getattr(args, "async_update_alpha", 1.0) or 0.0)
@@ -5607,121 +5662,56 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
     buffer_map = dict(core.named_buffers())
     now = time.time()
     applied: list[dict] = []
-    
-    server_url = os.environ.get("AGILLM_SYNC_SERVER", "http://5.75.217.57:9090")
-    if server_url:
-        import urllib.request, io
-        try:
-            req = urllib.request.Request(f"{server_url}/pull")
-            resp = urllib.request.urlopen(req, timeout=10)
-            data = resp.read()
-            if not data:
-                return []
-            path = pathlib.Path("http_pull.pt")
-            upd = torch.load(io.BytesIO(data), map_location="cpu")
-        except Exception as e:
-            print(json.dumps({"event": "async_side_update_pull_failed", "step": step, "error": str(e)}), flush=True)
-            return []
-        candidates = [(path, upd)]
-    else:
-        file_candidates = sorted(
-            [p for p in update_dir.glob("*.pt") if p.is_file() and not p.name.endswith(".tmp")],
-            key=lambda p: p.stat().st_mtime,
-        )
-        candidates = []
-        for p in file_candidates[:max_updates]:
-            if max_age > 0 and now - p.stat().st_mtime > max_age:
-                print(json.dumps({"event": "async_side_update_rejected", "step": step, "path": str(p), "error": "stale"}), flush=True)
-                try: _side_update_move(p, rejected_dir)
-                except: pass
-                continue
-            try:
-                candidates.append((p, _agillm43_load_pt(p, map_location="cpu", weights_only=False)))
-            except Exception as e:
-                try: _side_update_move(p, rejected_dir)
-                except: pass
-
-    for path, upd in candidates:
+    candidates = sorted(
+        [p for p in update_dir.glob("*.pt") if p.is_file() and not p.name.endswith(".tmp")],
+        key=lambda p: p.stat().st_mtime,
+    )
+    for path in candidates[:max_updates]:
         reject_reason = ""
         try:
+            if max_age > 0 and now - path.stat().st_mtime > max_age:
+                reject_reason = f"stale update older than {max_age:g}s"
+                raise ValueError(reject_reason)
+            upd = _agillm43_load_pt(path, map_location="cpu", weights_only=False)
             kind = upd.get("kind")
-            if kind not in {"agillm35_dblock_slice_update", "agillm4_dblock_slice_update", "agillm41_dblock_slice_update", "agillm43_sparse_update"}:
+            if kind not in {"agillm35_dblock_slice_update", "agillm4_dblock_slice_update", "agillm41_dblock_slice_update"}:
                 raise ValueError(f"bad update kind {kind!r}")
             if dict(upd.get("cfg", {})) != dict(cfg):
                 raise ValueError("cfg mismatch")
-            # Handle sparse and dense payload states
-            if kind == "agillm43_sparse_update":
-                sparse_delta = upd.get("sparse_delta", {})
-                changed = 0
-                device = next(core.parameters()).device if list(core.parameters()) else torch.device('cpu')
-                stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
-                ctx = torch.cuda.stream(stream) if stream else torch.no_grad()
-                with torch.no_grad(), ctx:
-                    for key, s in sparse_delta.items():
-                        target = param_map.get(key)
-                        if target is None:
-                            target = buffer_map.get(key)
-                        if target is None:
-                            continue
-                        if isinstance(s, dict) and "idx" in s: # Sparse Top-K
-                            idx = s["idx"].to(target.device)
-                            val = s["val"].to(target.device, dtype=target.dtype)
-                            flat_target = target.view(-1)
-                            # add the sparse delta * alpha
-                            flat_target.scatter_add_(0, idx, val * alpha)
-                        else: # Dense
-                            src = s.to(target.device, dtype=target.dtype)
-                            target.add_(src, alpha=alpha)
-                        changed += 1
-                if stream:
-                    stream.synchronize()
-                update_mode = "sparse_add"
-                block_codec = "sparse"
+            update_mode = "state_lerp"
+            block_state = upd.get("block_state")
+            block_delta_state = upd.get("block_delta_state")
+            if block_delta_state is not None:
+                update_mode = "delta_add"
+                block_codec = _agillm43_tensor_state_summary(block_delta_state)
+                block_state = _agillm43_decode_tensor_state(block_delta_state)
             else:
-                update_mode = "state_lerp"
-                block_state = upd.get("block_state")
-                block_delta_state = upd.get("block_delta_state")
-                if block_delta_state is not None:
-                    update_mode = "delta_add"
-                    block_codec = _agillm43_tensor_state_summary(block_delta_state)
-                    block_state = _agillm43_decode_tensor_state(block_delta_state)
-                else:
-                    block_codec = _agillm43_tensor_state_summary(block_state)
-                    block_state = _agillm43_decode_tensor_state(block_state)
-                if not isinstance(block_state, dict) or not block_state:
-                    raise ValueError("missing block_state or block_delta_state")
-                changed = 0
-                # Use a separate CUDA stream to prevent blocking the main training loop
-                device = next(core.parameters()).device if list(core.parameters()) else torch.device('cpu')
-                stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
-                ctx = torch.cuda.stream(stream) if stream else torch.no_grad()
-                with torch.no_grad(), ctx:
-                    for key, value in block_state.items():
-                        target = param_map.get(key)
-                        if target is None:
-                            target = buffer_map.get(key)
-                        if target is None:
-                            raise KeyError(f"unknown core key {key}")
-                        if tuple(value.shape) != tuple(target.shape):
-                            raise ValueError(f"{key} shape mismatch update={tuple(value.shape)} target={tuple(target.shape)}")
-                        src = value.to(device=target.device, dtype=target.dtype, non_blocking=True)
-                        if update_mode == "delta_add":
-                            if not target.is_floating_point():
-                                raise ValueError(f"{key} delta update targets non-floating tensor")
-                            target.add_(src, alpha=alpha)
-                        elif alpha >= 1.0:
-                            target.copy_(src)
-                        else:
-                            target.lerp_(src, alpha)
-                        changed += 1
-                        del src
-                if stream:
-                    stream.synchronize()
-            
-            if str(path) != "http_pull.pt":
-                dest = _side_update_move(path, accepted_dir)
-            else:
-                dest = path
+                block_codec = _agillm43_tensor_state_summary(block_state)
+                block_state = _agillm43_decode_tensor_state(block_state)
+            if not isinstance(block_state, dict) or not block_state:
+                raise ValueError("missing block_state or block_delta_state")
+            changed = 0
+            with torch.no_grad():
+                for key, value in block_state.items():
+                    target = param_map.get(key)
+                    if target is None:
+                        target = buffer_map.get(key)
+                    if target is None:
+                        raise KeyError(f"unknown core key {key}")
+                    if tuple(value.shape) != tuple(target.shape):
+                        raise ValueError(f"{key} shape mismatch update={tuple(value.shape)} target={tuple(target.shape)}")
+                    src = value.to(device=target.device, dtype=target.dtype, non_blocking=True)
+                    if update_mode == "delta_add":
+                        if not target.is_floating_point():
+                            raise ValueError(f"{key} delta update targets non-floating tensor")
+                        target.add_(src, alpha=alpha)
+                    elif alpha >= 1.0:
+                        target.copy_(src)
+                    else:
+                        target.lerp_(src, alpha)
+                    changed += 1
+                    del src
+            dest = _side_update_move(path, accepted_dir)
             rec = {
                 "path": str(dest),
                 "worker_id": upd.get("worker_id"),
@@ -5737,12 +5727,9 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
             applied.append(rec)
             print(json.dumps({"event": "async_side_update_applied", "step": step, **rec}), flush=True)
         except Exception as exc:
-            if str(path) != "http_pull.pt":
-                try:
-                    dest = _side_update_move(path, rejected_dir)
-                except Exception:
-                    dest = path
-            else:
+            try:
+                dest = _side_update_move(path, rejected_dir)
+            except Exception:
                 dest = path
             print(
                 json.dumps(
@@ -6212,7 +6199,10 @@ def _train_phase(
         print(f"[data] per-restart shuffle seed {data_seed} (derived from resume step)", flush=True)
     effective_source = get_hot_datasets(source)
     val_requested = str(getattr(args, "val_source", "") or "").strip()
-    val_effective = val_requested or effective_source
+    if val_requested and _looks_numeracy_only_sources(val_requested) and not _looks_numeracy_only_sources(effective_source):
+        val_effective = effective_source
+    else:
+        val_effective = val_requested or effective_source
     dataset_meta = _dataset_provenance(
         phase_name, source, effective_source, args,
         use_hot_config=True,
@@ -6249,6 +6239,7 @@ def _train_phase(
     now_wall = time.time()
     last_save_mono = time.monotonic() - (now_wall - (resume_wall_time or now_wall))
     last_delta_step = start_step
+    last_delta_mono = last_save_mono
     last_heartbeat_mono = time.monotonic()
     _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="startup")
     if val_batches:
@@ -6465,9 +6456,7 @@ def _train_phase(
         pbar.update(toks_processed)
         async_every = int(getattr(args, "async_update_every_steps", 0) or 0)
         if async_every > 0 and (step % async_every) == 0:
-            import threading
-            threading.Thread(target=_apply_async_side_updates, args=(core, cfg, args, step), daemon=True).start()
-            threading.Thread(target=_push_async_side_update, args=(core, cfg, args, step), daemon=True).start()
+            _apply_async_side_updates(core, cfg, args, step)
         empty_cache_every = int(getattr(args, "empty_cache_every_steps", 0) or 0)
         if DEV.type == "cuda" and empty_cache_every > 0 and (step % empty_cache_every) == 0:
             try:
@@ -6569,11 +6558,15 @@ def _train_phase(
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
             last_save_mono = time.monotonic()
             _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
+            last_delta_step = step
             last_delta_mono = time.monotonic()
             print(f"[{phase_name}] ON-DEMAND flush saved {_ck_name} at step {step}")
-        if args.save_every_sec > 0:
+        _save_sec = get_hot_config().get("save_every_sec", args.save_every_sec)
+        try: _save_sec = float(_save_sec)
+        except Exception: _save_sec = args.save_every_sec
+        if _save_sec > 0:
             now_mono = time.monotonic()
-            if now_mono - last_save_mono >= args.save_every_sec:
+            if now_mono - last_save_mono >= _save_sec:
                 ck_name = f"{phase_name}_step{step:08d}.pt"
                 _flush_delta()  # wait for any in-flight delta before full save
                 _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-save")
@@ -6585,9 +6578,20 @@ def _train_phase(
                 last_save_mono = now_mono
                 # Prune old deltas after a full save (they're superseded)
                 _prune_deltas(pathlib.Path(args.save_dir), phase_name, args.delta_max_keep)
-                last_delta_mono = now_mono  # reset delta counter after full save
-        # ── Delta checkpoint (time-based, weight-only, async) ──
-        if args.delta_every_sec > 0 and (time.monotonic() - last_delta_mono) >= args.delta_every_sec:
+                last_delta_step = step  # reset delta counter after full save
+                last_delta_mono = now_mono
+        # ── Delta checkpoint (time-based preferred, optional step fallback, weight-only, async) ──
+        hot_cfg = get_hot_config()
+        _delta_steps = hot_cfg.get("delta_every_steps", args.delta_every_steps)
+        try: _delta_steps = int(_delta_steps)
+        except Exception: _delta_steps = args.delta_every_steps
+        _delta_sec = hot_cfg.get("delta_every_sec", args.delta_every_sec)
+        try: _delta_sec = float(_delta_sec)
+        except Exception: _delta_sec = args.delta_every_sec
+        now_mono = time.monotonic()
+        _delta_due_by_steps = _delta_steps > 0 and (step - last_delta_step) >= _delta_steps
+        _delta_due_by_time = _delta_sec > 0 and (now_mono - last_delta_mono) >= _delta_sec
+        if _delta_due_by_steps or _delta_due_by_time:
             save_root = pathlib.Path(args.save_dir)
             # AGILLM4 production runs on small rented disks. When keep=1, prune
             # old deltas before the async writer creates the next multi-GB file.
@@ -6595,7 +6599,8 @@ def _train_phase(
                 _flush_delta()
                 _prune_delta_files_to_count(save_root, phase_name, args.delta_max_keep - 1)
             save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"))
-            last_delta_mono = time.monotonic()
+            last_delta_step = step
+            last_delta_mono = now_mono
         if args.auto_grow:
             steps_since_last_grow += 1
             if steps_since_last_grow >= args.grow_every_steps:
@@ -7895,7 +7900,7 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
         "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
         "--save_dir", str(save_dir), "--save_every_sec", prof.get("save_every_sec", "14400"), "--heartbeat_every_sec", "300",
-        "--empty_cache_every_steps", "0", "--delta_every_sec", "1800", "--delta_max_keep", "1", "--max_ckpts", "1",
+        "--empty_cache_every_steps", "0", "--delta_every_steps", "0", "--delta_every_sec", str(DEFAULT_DELTA_SEC), "--delta_max_keep", "1", "--max_ckpts", "1",
         "--async_update_dir", incoming, "--async_update_every_steps", "100", "--async_update_alpha", "0.05",
         "--async_update_max_per_check", "2", "--async_update_max_age_sec", "86400",
         "--async_update_accepted_dir", accepted, "--async_update_rejected_dir", rejected,
@@ -8141,6 +8146,7 @@ def main():
                     help="Profile the first N DBlock training steps with in-process CUDA timers; 0 disables.")
     tr.add_argument("--profile_log_every", type=int, default=25,
                     help="Print averaged profiler timings every N profiled steps.")
+    tr.add_argument("--delta_every_steps", type=int, default=DEFAULT_DELTA_STEPS, help="Weight-only delta save every N steps (0=off; production should prefer --delta_every_sec)")
     tr.add_argument("--delta_every_sec", type=int, default=DEFAULT_DELTA_SEC, help="Weight-only delta save every N seconds (0=off)")
     tr.add_argument("--delta_max_keep", type=int, default=DEFAULT_MAX_DELTAS, help="Max delta checkpoints to keep")
     tr.add_argument("--delta_codec", default=os.environ.get("AGILLM43_DELTA_CODEC", "zstd3"),

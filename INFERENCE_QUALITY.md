@@ -36,8 +36,8 @@ Save results to this file and to MCP Silicon Goddess memory (next available slot
 | Mode | Output | Speed | Notes |
 |------|--------|-------|-------|
 | AR | `the  \ Then fact that we it was was he she he he was was then but and and after he, said 26 November 14 October August July23, he he. He She she Tom She She he was she He George Brown Louis Gary However,, Tom, said, as after after the December 201 January October March November August April November August` | 1.2 tok/s (CPU) | Knows names/dates, not yet coherent. Expected at 6% training. |
-| SAT | *(pending — job running)* | — | — |
-| NAT | *(pending — job running)* | — | — |
+| SAT | `The future of artificial intelligence is said was he said she he was told the, and October according to201 "2After. January she February had his September first August December November17 May18...` | 1.4 tok/s (CPU) | SAT diffusion mode: non-sequential token ordering. Date/number scatter expected at early training. |
+| NAT | `The future of artificial intelligence is2. ] & " The || ...a-SD alignin[ \end>T (WeTosth*R (In5BM{)FFor3 -Bythe |b}for1^ICleG0refingAAnW thewcfLandN` | 15.7 tok/s (CPU) | NAT non-autoregressive: all tokens generated in parallel. Output is symbol-heavy — expected at early training. Fast by design. |
 
 **Overall assessment:** Early-stage output. Structure present (pronouns, proper nouns, date patterns). Fluency/coherence will improve significantly as training progresses toward 67B token target.
 

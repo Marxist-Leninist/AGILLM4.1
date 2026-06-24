@@ -5252,7 +5252,7 @@ def _fuse_legacy_qkv_optimizer_state(opt_state: dict, opt, core, ar_h, sat_h, na
 
     return {"state": new_states, "param_groups": new_groups}
 
-def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str, delta_codec: str = "zstd3", provenance=None):
+def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str, delta_codec: str = "zstd3", provenance=None, origin_tag: str = "", dt_tag: str = "", role_tag: str = ""):
     """Save weight-only delta in background thread. Non-blocking."""
     global _delta_thread
     # Wait for any previous delta write to finish
@@ -5278,7 +5278,7 @@ def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pat
                 batch_size=0, block_size=0, checkpoint_type="delta"))
     except Exception:
         pass
-    path = save_dir / f"{phase_name}_delta_step{step:08d}.pt"
+    path = save_dir / f"{phase_name}_delta_step{step:08d}{origin_tag}{dt_tag}{role_tag}.pt"
     _delta_thread = threading.Thread(target=_do_delta_save, args=(tensors, path, meta, delta_codec), daemon=True)
     _delta_thread.start()
 
@@ -6427,6 +6427,12 @@ def _train_phase(
     last_delta_mono = last_save_mono
     last_heartbeat_mono = time.monotonic()
     _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="startup")
+    # Derive origin tag from warmstart path for checkpoint naming
+    _ws_path = getattr(args, "warmstart_from", None) or getattr(args, "resume", None) or ""
+    _ws_m = re.search(r"step(\d+)", pathlib.Path(_ws_path).name) if _ws_path else None
+    _origin_tag = f"_from{int(_ws_m.group(1)):08d}" if _ws_m else ""
+    _role_tag = f"_{getattr(args, 'ckpt_role', '').strip()}" if getattr(args, "ckpt_role", "").strip() else ""
+
     if val_batches:
         _run_validation(core, ar_h, val_batches, args, step)
     print(f"[{phase_name}] Starting. Goal: {total_tokens_needed:,} tokens. Batch={BATCH}, Block={BLOCK}")
@@ -6753,7 +6759,7 @@ def _train_phase(
                 _flush_sentinel.unlink()
             except FileNotFoundError:
                 pass
-            _ck_name = f"{phase_name}_step{step:08d}.pt"
+            _ck_name = f"{phase_name}_step{step:08d}{_origin_tag}{time.strftime('_%Y%m%dT%H%MZ', time.gmtime())}{_role_tag}.pt"
             _flush_delta()
             _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-flush-save")
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
@@ -6781,7 +6787,7 @@ def _train_phase(
         if _save_sec > 0:
             now_mono = time.monotonic()
             if now_mono - last_save_mono >= _save_sec:
-                ck_name = f"{phase_name}_step{step:08d}.pt"
+                ck_name = f"{phase_name}_step{step:08d}{_origin_tag}{time.strftime('_%Y%m%dT%H%MZ', time.gmtime())}{_role_tag}.pt"
                 _flush_delta()  # wait for any in-flight delta before full save
                 _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-save")
                 _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
@@ -6828,7 +6834,7 @@ def _train_phase(
                 warmstart_source_provenance=provenance_cache,
                 dataset_provenance=dataset_meta, lane=phase_name or "",
                 checkpoint_type="delta")
-            save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"), provenance=_delta_prov)
+            save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"), provenance=_delta_prov, origin_tag=_origin_tag, dt_tag=time.strftime("_%Y%m%dT%H%MZ", time.gmtime()), role_tag=_role_tag)
             last_delta_step = step
             last_delta_mono = now_mono
         if args.auto_grow:
@@ -8440,6 +8446,8 @@ def main():
     tr.add_argument("--resume", type=str)
     tr.add_argument("--x2", action="store_true")
     tr.add_argument("--warmstart_from", type=str)
+    tr.add_argument("--ckpt_role", type=str, default="",
+                    help="Federation role tag embedded in checkpoint filenames (e.g. master, lease, coordinator). Empty = no tag.")
     tr.add_argument("--fresh", action="store_true")
     tr.add_argument("--max_ckpts", type=int, default=2)
     tr.add_argument("--chilla_max_double", action="store_true")

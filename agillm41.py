@@ -3315,7 +3315,7 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         router_last_save = now
         try:
             router["updated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-            tmp = router_state_path.with_suffix(router_state_path.suffix + ".tmp")
+            tmp = router_state_path.with_suffix(router_state_path.suffix + f".{os.getpid()}.tmp")
             tmp.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(router, indent=2, sort_keys=True) + "\n")
             tmp.replace(router_state_path)
@@ -7428,6 +7428,34 @@ def _dblock_euler_hidden(core, ids, args):
 
 @torch.no_grad()
 def infer(args):
+    global DEV
+    _requested_device = getattr(args, "device", "auto")
+    _effective_device = _requested_device
+    if _effective_device == "auto":
+        _effective_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if _effective_device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda requested but CUDA is not available")
+    DEV = torch.device(_effective_device)
+    if DEV.type == "cpu" and bool(getattr(args, "block_stream", False)):
+        print("[infer] --block_stream requested with --device cpu; disabling block_stream", flush=True)
+        args.block_stream = False
+    print(f"[infer] device={DEV} requested={_requested_device} cuda_available={torch.cuda.is_available()}", flush=True)
+    if DEV.type == "cpu":
+        _cpu_threads = int(getattr(args, "cpu_threads", 0) or 0)
+        if _cpu_threads <= 0:
+            _cpu_threads = max(1, min(16, int(os.cpu_count() or 1)))
+        try:
+            torch.set_num_threads(_cpu_threads)
+            print(f"[infer] cpu_threads={_cpu_threads}", flush=True)
+        except Exception as exc:
+            print(f"[infer] warning: could not set cpu_threads={_cpu_threads}: {exc}", flush=True)
+        _cpu_interop_threads = int(getattr(args, "cpu_interop_threads", 0) or 0)
+        if _cpu_interop_threads > 0:
+            try:
+                torch.set_num_interop_threads(_cpu_interop_threads)
+                print(f"[infer] cpu_interop_threads={_cpu_interop_threads}", flush=True)
+            except Exception as exc:
+                print(f"[infer] warning: could not set cpu_interop_threads={_cpu_interop_threads}: {exc}", flush=True)
     if args.mode == "ar":
         if args.temperature is None: args.temperature = 0.7
         if args.top_k is None: args.top_k = 0
@@ -8600,6 +8628,12 @@ def main():
     inf.add_argument("--euler_start_sigma", type=float, default=0.0, help="Euler start noise (0=sigma_max; lower=stronger context conditioning).")
     inf.add_argument("--dblock_blocks", type=int, default=4, help="Number of DiffusionBlocks for the Euler sampler.")
     inf.add_argument("--ckpt", required=True)
+    inf.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
+                     help="Inference compute device. auto uses CUDA when available; cpu forces CPU-only inference.")
+    inf.add_argument("--cpu_threads", type=int, default=0,
+                     help="CPU inference intra-op threads. 0=auto, capped at 16; only used when --device resolves to cpu.")
+    inf.add_argument("--cpu_interop_threads", type=int, default=0,
+                     help="CPU inference inter-op threads. 0=PyTorch default; only used when --device resolves to cpu.")
     inf.add_argument("--prompt", required=True)
     inf.add_argument("--max_new", type=int, default=120)
     inf.add_argument("--min_new", type=int, default=0, help="Minimum generated tokens before EOS can stop decoding. SAT enforces at least one block.")

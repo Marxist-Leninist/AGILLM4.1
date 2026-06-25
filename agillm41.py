@@ -4493,8 +4493,10 @@ class Encoder(nn.Module):
         else:
             self.anchor = None
 
-    def forward(self, ids, mask, kv_caches=None, use_cache=False, total_seq_len=None):
-        x = self.emb(ids)
+    def forward(self, ids, mask, kv_caches=None, use_cache=False, total_seq_len=None, inputs_embeds=None):
+        # SwiReasoning: latent steps inject a continuous thought vector instead of a
+        # discrete token embedding. inputs_embeds is [B, T, d].
+        x = self.emb(ids) if inputs_embeds is None else inputs_embeds
         if not use_cache:
             for i, blk in enumerate(self.blocks):
                 if self.grad_checkpoint and self.training:
@@ -5818,14 +5820,14 @@ def _side_update_move(path: pathlib.Path, directory: pathlib.Path) -> pathlib.Pa
         shutil.move(str(path), str(dest))
     return dest
 
-def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> list[dict]:
+def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> tuple[list[dict], list[dict]]:
     update_dir_s = str(getattr(args, "async_update_dir", "") or "").strip()
     alpha = float(getattr(args, "async_update_alpha", 1.0) or 0.0)
     if not update_dir_s or alpha <= 0.0:
-        return []
+        return [], []
     update_dir = pathlib.Path(update_dir_s)
     if not update_dir.exists():
-        return []
+        return [], []
     max_updates = max(1, int(getattr(args, "async_update_max_per_check", 1) or 1))
     max_age = float(getattr(args, "async_update_max_age_sec", 0.0) or 0.0)
     accepted_dir = pathlib.Path(getattr(args, "async_update_accepted_dir", "") or (update_dir.parent / "accepted"))
@@ -5834,6 +5836,7 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
     buffer_map = dict(core.named_buffers())
     now = time.time()
     applied: list[dict] = []
+    rejected: list[dict] = []
     candidates = sorted(
         [p for p in update_dir.glob("*.pt") if p.is_file() and not p.name.endswith(".tmp")],
         key=lambda p: p.stat().st_mtime,
@@ -5903,18 +5906,103 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
                 dest = _side_update_move(path, rejected_dir)
             except Exception:
                 dest = path
+            err = reject_reason or str(exc)
             print(
                 json.dumps(
                     {
                         "event": "async_side_update_rejected",
                         "step": step,
                         "path": str(dest),
-                        "error": reject_reason or str(exc),
+                        "error": err,
                     }
                 ),
                 flush=True,
             )
-    return applied
+            try:
+                upd_partial = _agillm43_load_pt(dest, map_location="cpu", weights_only=False) if dest.exists() else {}
+            except Exception:
+                upd_partial = {}
+            rejected.append({
+                "path": str(dest),
+                "worker_id": upd_partial.get("worker_id"),
+                "block_id": upd_partial.get("block_id"),
+                "layers": upd_partial.get("layers"),
+                "error": err,
+            })
+    return applied, rejected
+
+# ── HF federation dataset logging ─────────────────────────────────────────────
+_HF_FED_UPDATES_REPO = "OpenTransformer/AGILLM-4.3-fed-updates"
+_HF_FED_ROUNDS_REPO  = "OpenTransformer/AGILLM-4.3-fed-rounds"
+
+def _hf_fed_log_rows_bg(repo_id: str, rows: list, step: int) -> None:
+    """Append JSONL rows to an HF dataset repo in a fire-and-forget background thread."""
+    if not rows:
+        return
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        return
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        return
+
+    def _upload():
+        try:
+            api = HfApi(token=token)
+            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            fname = f"data/{step:08d}-{ts}-{os.getpid()}.jsonl"
+            content = "\n".join(json.dumps(r, separators=(",", ":")) for r in rows) + "\n"
+            api.upload_file(
+                path_or_fileobj=content.encode(),
+                path_in_repo=fname,
+                repo_id=repo_id,
+                repo_type="dataset",
+                commit_message=f"fed log step {step}",
+            )
+        except Exception as exc:
+            print(f"[hf-fed-log] {repo_id} upload failed: {exc}", flush=True)
+
+    threading.Thread(target=_upload, daemon=True).start()
+
+
+def _hf_fed_log_side_updates(applied: list, rejected: list, step: int) -> None:
+    """Log accepted/rejected side-updates to HF AGILLM-4.3-fed-updates."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rows = []
+    for rec in applied:
+        rows.append({
+            "ts_utc": ts, "step": step, "status": "accepted",
+            "worker_id": rec.get("worker_id"), "block_id": rec.get("block_id"),
+            "layers": rec.get("layers"), "tokens": rec.get("tokens"),
+            "tok_per_sec": rec.get("tok_per_sec"), "alpha": rec.get("alpha"),
+            "keys": rec.get("keys"), "update_mode": rec.get("update_mode"),
+            "block_codec": rec.get("block_codec"),
+        })
+    for rec in rejected:
+        rows.append({
+            "ts_utc": ts, "step": step, "status": "rejected",
+            "worker_id": rec.get("worker_id"), "block_id": rec.get("block_id"),
+            "layers": rec.get("layers"), "tokens": None,
+            "tok_per_sec": None, "alpha": None, "keys": None,
+            "update_mode": None, "block_codec": None,
+            "error": rec.get("error"),
+        })
+    _hf_fed_log_rows_bg(_HF_FED_UPDATES_REPO, rows, step)
+
+
+def _hf_fed_log_round(step: int, seen_tok: int, loss: float, role_tag: str, origin_tag: str) -> None:
+    """Log a delta-save event (federation round boundary) to HF AGILLM-4.3-fed-rounds."""
+    row = {
+        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "step": step,
+        "seen_tok": int(seen_tok),
+        "loss": round(float(loss), 6),
+        "role_tag": role_tag,
+        "origin_tag": origin_tag,
+    }
+    _hf_fed_log_rows_bg(_HF_FED_ROUNDS_REPO, [row], step)
+# ── end HF federation dataset logging ─────────────────────────────────────────
 
 def _optimizer_param_groups(core, ar_h, sat_h, lr_core: float, lr_head: float, nat_h=None):
     # Shared/tied vocab projections must appear in only one optimizer group.
@@ -6649,7 +6737,7 @@ def _train_phase(
         pbar.update(toks_processed)
         async_every = int(getattr(args, "async_update_every_steps", 0) or 0)
         if async_every > 0 and (step % async_every) == 0:
-            _apply_async_side_updates(core, cfg, args, step)
+            _hf_fed_log_side_updates(*_apply_async_side_updates(core, cfg, args, step), step)
         empty_cache_every = int(getattr(args, "empty_cache_every_steps", 0) or 0)
         if DEV.type == "cuda" and empty_cache_every > 0 and (step % empty_cache_every) == 0:
             try:
@@ -6837,6 +6925,7 @@ def _train_phase(
             save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"), provenance=_delta_prov, origin_tag=_origin_tag, dt_tag=time.strftime("_%Y%m%dT%H%MZ", time.gmtime()), role_tag=_role_tag)
             last_delta_step = step
             last_delta_mono = now_mono
+            _hf_fed_log_round(step, seen_tok, loss_value, _role_tag, _origin_tag)
         if args.auto_grow:
             steps_since_last_grow += 1
             if steps_since_last_grow >= args.grow_every_steps:
@@ -7117,6 +7206,92 @@ def _sample(logits, T, top_k, top_p, min_p, greedy):
     if min_p > 0: probs[probs < min_p] = 0
     if probs.sum() == 0: return logits.argmax(-1, keepdim=True)
     return probs.div_(probs.sum()).multinomial(1)
+
+
+def _swi_entropy(probs):
+    """Shannon entropy (nats) of a [B, V] distribution, averaged over batch."""
+    p = probs.clamp_min(1e-12)
+    return float(-(p * p.log()).sum(-1).mean())
+
+
+def _swi_soft_embed(core, probs, top_k):
+    """Continuous 'thought' = probability-weighted average of token embeddings.
+
+    The model's next-token belief stays in superposition in hidden space rather
+    than collapsing to one discrete token. Restricting to top-k mass keeps it sharp.
+    """
+    E = core.emb.weight                                    # [V, d]
+    if top_k and 0 < top_k < probs.size(-1):
+        v, i = torch.topk(probs, top_k, dim=-1)           # [B, k]
+        v = v / v.sum(-1, keepdim=True).clamp_min(1e-12)
+        thought = (v.unsqueeze(-1) * E[i]).sum(1)          # [B, d]
+    else:
+        thought = probs.to(E.dtype) @ E                    # [B, d]
+    return thought.unsqueeze(1).to(E.dtype)                # [B, 1, d]
+
+
+def _swireasoning_decode(core, ar_h, ids, args, min_new):
+    """Training-free SwiReasoning decode for the AR path.
+
+    Alternates between two reasoning regimes, gated by next-token entropy:
+      EXPLICIT — sample a real token (model thinks out loud).
+      LATENT   — inject a continuous thought embedding and emit NO token; model
+                 reasons silently in hidden space (token-efficient).
+
+    Policy: diffuse / rising entropy → drop into latent to explore in superposition;
+    low / sharply-falling entropy → switch back to explicit to consolidate.
+    --swi_max_switches and --swi_think_budget cap overthinking.
+    """
+    use_struct = use_structured_masks(args)
+    seq_len = ids.size(1)
+    h, kvs = core(ids, causal_mask(seq_len, structured=use_struct),
+                  use_cache=True, total_seq_len=seq_len)
+    mode = "latent" if getattr(args, "swi_start_latent", False) else "explicit"
+    switches = latent_run = think_steps = emitted = 0
+    prev_H = None
+    n_latent = n_explicit = 0
+    while emitted < args.max_new and think_steps < args.swi_max_steps:
+        logits_last = ar_h(h)[:, -1].float()
+        probs_raw = (logits_last / max(args.temperature, 1e-8)).softmax(-1)
+        H = _swi_entropy(probs_raw)
+        dH = 0.0 if prev_H is None else (H - prev_H)
+        prev_H = H
+
+        thinking = think_steps < args.swi_think_budget
+        if thinking and switches < args.swi_max_switches:
+            if mode == "latent":
+                if (H < args.swi_explicit_thresh or dH < -args.swi_eps
+                        or latent_run >= args.swi_max_latent):
+                    mode, switches, latent_run = "explicit", switches + 1, 0
+            else:
+                if H > args.swi_latent_thresh and dH > args.swi_eps:
+                    mode, switches = "latent", switches + 1
+        else:
+            mode = "explicit"
+
+        if mode == "latent":
+            thought = _swi_soft_embed(core, probs_raw, args.swi_topk)
+            seq_len += 1; think_steps += 1; latent_run += 1; n_latent += 1
+            h, kvs = core(None, None, kv_caches=kvs, use_cache=True,
+                          total_seq_len=seq_len, inputs_embeds=thought)
+            continue
+
+        logits = _apply_penalties(logits_last, ids, args.penalty_last_n,
+                                  args.repetition_penalty, args.presence_penalty,
+                                  args.frequency_penalty)
+        logits = _suppress_eos(logits, args, emitted < min_new)
+        nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
+        ids = torch.cat([ids, nxt], 1)
+        emitted += 1; think_steps += 1; n_explicit += 1
+        if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
+            break
+        seq_len += 1
+        h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=seq_len)
+    saved = (n_latent / max(1, n_latent + n_explicit)) * 100.0
+    print(f"[swi] explicit={n_explicit} latent={n_latent} switches={switches} "
+          f"({saved:.0f}% of reasoning steps emitted no token)")
+    return ids
+
 
 def _dblock_block_layers(core, dblock_blocks):
     L = len(core.blocks)
@@ -7636,7 +7811,14 @@ def infer(args):
     if (block_stream or resident_dtype) and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     start = time.time()
-    if args.mode == "ar":
+    if args.mode == "ar" and getattr(args, "swi_reasoning", False):
+        if getattr(args, "block_stream", False) or getattr(args, "sampler", "ar") == "euler":
+            print("[swi] --swi_reasoning needs plain KV decode "
+                  "(no --block_stream / --sampler euler); falling back to standard AR.")
+            args.swi_reasoning = False
+    if args.mode == "ar" and getattr(args, "swi_reasoning", False):
+        ids = _swireasoning_decode(core, ar_h, ids, args, min_new)
+    elif args.mode == "ar":
         _euler = getattr(args, "sampler", "ar") == "euler"
         block_stream_kv = block_stream and _block_stream_kv_cache_enabled(args)
         kvs = None
@@ -8664,6 +8846,27 @@ def main():
     inf.add_argument("--nat_passes", type=int, default=1)
     inf.add_argument("--ignore_eos", action="store_true",
                      help="Never stop on (or sample) EOS: suppress its logit and emit exactly max_new tokens. For base-model / SAT-head testing.")
+    # ── SwiReasoning: entropy-gated explicit/latent AR decode ──────────────────
+    inf.add_argument("--swi_reasoning", action="store_true",
+                     help="Enable SwiReasoning: alternate between explicit token CoT and silent latent reasoning, gated by next-token entropy. AR + plain KV decode only.")
+    inf.add_argument("--swi_latent_thresh", type=float, default=2.5,
+                     help="Entropy (nats) above which an explicit step switches to latent (low confidence -> think silently).")
+    inf.add_argument("--swi_explicit_thresh", type=float, default=1.0,
+                     help="Entropy (nats) below which a latent step switches back to explicit (high confidence -> consolidate out loud).")
+    inf.add_argument("--swi_eps", type=float, default=0.05,
+                     help="Min entropy delta (nats) to count as a confidence trend when deciding to switch.")
+    inf.add_argument("--swi_max_switches", type=int, default=8,
+                     help="Max latent<->explicit switches during thinking phase. After budget is spent decoder stays explicit.")
+    inf.add_argument("--swi_max_latent", type=int, default=16,
+                     help="Max consecutive latent steps before forcing back to explicit.")
+    inf.add_argument("--swi_think_budget", type=int, default=256,
+                     help="Total reasoning steps (latent+explicit) allowed to switch; after this stays explicit to finish.")
+    inf.add_argument("--swi_max_steps", type=int, default=4096,
+                     help="Hard cap on total think_steps (latent+explicit) before stopping.")
+    inf.add_argument("--swi_topk", type=int, default=20,
+                     help="Top-k mass to use for the soft thought embedding in latent steps.")
+    inf.add_argument("--swi_start_latent", action="store_true",
+                     help="Begin in latent mode instead of explicit (starts silent).")
     inf.add_argument("--infer_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
                      help="Resident inference dtype. fp16/bf16 load on CPU, convert, then move the model to CUDA to avoid fp32 VRAM spikes.")
     inf.add_argument("--block_stream", action="store_true",

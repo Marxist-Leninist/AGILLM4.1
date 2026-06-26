@@ -8385,7 +8385,7 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
         "--save_dir", str(save_dir), "--save_every_sec", prof.get("save_every_sec", "14400"), "--heartbeat_every_sec", "300",
         "--empty_cache_every_steps", "0", "--delta_every_steps", "0", "--delta_every_sec", str(DEFAULT_DELTA_SEC), "--delta_max_keep", "1", "--max_ckpts", "1",
-        "--async_update_dir", incoming, "--async_update_every_steps", "100", "--async_update_alpha", "0.05",
+        "--async_update_dir", incoming, "--async_update_every_steps", os.environ.get("AGILLM43_ASYNC_UPDATE_EVERY_STEPS", "50"), "--async_update_alpha", os.environ.get("AGILLM43_ASYNC_UPDATE_ALPHA", "0.10"),
         "--async_update_max_per_check", "2", "--async_update_max_age_sec", "86400",
         "--async_update_accepted_dir", accepted, "--async_update_rejected_dir", rejected,
     ]

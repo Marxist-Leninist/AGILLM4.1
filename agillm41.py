@@ -847,6 +847,28 @@ def _dblock_init(core, args):
         "loss_ema": [None for _ in range(B)],
         "last_seen": [-1 for _ in range(B)],
     })
+    if bool(getattr(args, "dblock_looped", False)):
+        loop_layers = int(getattr(args, "dblock_loop_layers", 0) or 0)
+        if loop_layers <= 0:
+            loop_layers = max(1, L // max(1, B))
+        loop_layers = max(1, min(loop_layers, L))
+        loop_start = max(0, min(int(getattr(args, "dblock_loop_start", 0) or 0), L - loop_layers))
+        loop_group = list(range(loop_start, loop_start + loop_layers))
+        if not hasattr(core, "dblock_loop_embed"):
+            d = int(getattr(core.emb, "embedding_dim", 0))
+            core.dblock_loop_embed = nn.Embedding(B, d).to(core.emb.weight.device)
+            nn.init.normal_(core.dblock_loop_embed.weight, mean=0.0, std=0.02)
+        state.update({
+            "looped": True,
+            "loop_group": loop_group,
+            "loop_layers": loop_layers,
+            "loop_start": loop_start,
+        })
+        print(
+            f"[dblock-looped] enabled: shared_layers={loop_group} bands={B} "
+            f"unrolled_depth={loop_layers * B} one-band-per-step no_bptt=True",
+            flush=True,
+        )
     _dblock_router_boot(state, args, ctx_dim=int(getattr(core.emb, "embedding_dim", 0)) or None)
     return state
 
@@ -1189,6 +1211,38 @@ def _dblock_checkpoint_this_layer(args, base_enabled, layer_pos, layer_count=Non
     return (pos % stride) == 0
 
 
+def _dblock_loop_condition(core, h, block_idx, args):
+    emb = getattr(core, "dblock_loop_embed", None)
+    if emb is None:
+        return h
+    idx = torch.tensor([int(block_idx)], device=h.device, dtype=torch.long)
+    cond = emb(idx).to(dtype=h.dtype).view(1, 1, -1)
+    return h + float(getattr(args, "dblock_loop_cond_scale", 1.0) or 0.0) * cond
+
+
+def _maybe_register_looped_infer(core, sd, args):
+    """Looped checkpoints carry 'dblock_loop_embed.weight' in their core state.
+    Recreate the matching embedding on the inference core (so the strict core load
+    accepts it) and flip args into looped mode so the EDM block-chain decodes
+    through the single shared looped group with loop-index conditioning."""
+    core_sd = sd.get("core") if isinstance(sd, dict) else None
+    if not isinstance(core_sd, dict):
+        return
+    w = core_sd.get("dblock_loop_embed.weight")
+    if w is None:
+        return
+    bands = int(w.shape[0])
+    d = int(getattr(core.emb, "embedding_dim", 0)) or int(w.shape[1])
+    if not hasattr(core, "dblock_loop_embed"):
+        core.dblock_loop_embed = nn.Embedding(bands, d).to(core.emb.weight.device)
+    try:
+        setattr(args, "dblock_looped", True)
+        setattr(args, "dblock_blocks", bands)
+    except Exception:
+        pass
+    print("[dblock-looped] inference: shared looped group, bands=%d" % bands, flush=True)
+
+
 def _sample_token_loss_inputs(hidden, targets, max_tokens):
     max_tokens = int(max_tokens or 0)
     if max_tokens <= 0:
@@ -1255,6 +1309,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     bi = _choose_block(state, args)
     lo, hi = sorted([bs[bi], bs[bi + 1]])
     layers = asg[bi]
+    if state.get("looped", False):
+        layers = state.get("loop_group") or layers
     sig = _sample_sigma(ids, lo, hi, args, state)
     cs, co, ci = _edm_pre(sig)
     w = _edm_w(sig, float(getattr(args, "dblock_edm_wmax", 5.0)))
@@ -1292,7 +1348,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         with M.amp(args.amp):
             emb = core.emb(ids)
             zt = emb + sig[:, None, None] * torch.randn_like(emb)
-            h = ci * zt
+            h = _dblock_loop_condition(core, ci * zt, bi, args) if state.get("looped", False) else ci * zt
             for lpos, li in enumerate(layers):
                 mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
                 h = _run_block(core.blocks[li], h, causal, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
@@ -1321,7 +1377,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         with M.amp(args.amp):
             emb2 = core.emb(ids)
             zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
-            h2 = ci * zt2
+            h2 = _dblock_loop_condition(core, ci * zt2, bi, args) if state.get("looped", False) else ci * zt2
             for lpos, li in enumerate(layers):
                 mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
                 h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
@@ -1387,6 +1443,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             else:
                 nat_in[m] = M.BLANK
                 hn = core.emb(nat_in)
+            if state.get("looped", False):
+                hn = _dblock_loop_condition(core, hn, bi, args)
             for lpos, li in enumerate(layers):
                 mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
                 hn = _run_block(core.blocks[li], hn, None, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
@@ -7071,6 +7129,11 @@ def train(args):
     ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV)
     sat_h = SATHead(cfg["d"], mode="var", tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV)
     nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV) if use_nat_head else None
+    if bool(getattr(args, "dblock_looped", False)):
+        loop_bands = max(1, int(getattr(args, "dblock_blocks", 4) or 4))
+        core.dblock_loop_embed = nn.Embedding(loop_bands, int(cfg["d"])).to(DEV)
+        nn.init.normal_(core.dblock_loop_embed.weight, mean=0.0, std=0.02)
+        print(f"[dblock-looped] registered loop-index embedding: bands={loop_bands} dim={int(cfg['d'])}", flush=True)
     total_params = _count_enabled_params(core, ar_h, sat_h, nat_h)
     print(f"Total parameters: {total_params:,}")
     if tie_weights:
@@ -7587,9 +7650,11 @@ def _block_stream_forward_cached(core, ids, mask, kv_caches, total_seq_len, args
     return core.ln(x), new_kvs
 
 
-def _edm_denoise_block(core, layers, z, sigma_t, mask, args):
+def _edm_denoise_block(core, layers, z, sigma_t, mask, args, block_idx=None):
     cs, co, ci = _edm_pre(sigma_t)
     h = ci * z
+    if block_idx is not None and getattr(core, "dblock_loop_embed", None) is not None:
+        h = _dblock_loop_condition(core, h, block_idx, args)
     if _block_stream_enabled(args):
         device = _block_stream_compute_device(args)
         for li in layers:
@@ -7614,7 +7679,15 @@ def _dblock_euler_hidden(core, ids, args):
     dblock_blocks = int(getattr(args, "dblock_blocks", 4) or 4)
     steps = max(dblock_blocks, int(getattr(args, "euler_steps", 0) or (dblock_blocks * 2)))
     bsig = _block_sigmas(dblock_blocks, *_dblock_sigma_config(args))
-    groups = _dblock_block_layers(core, dblock_blocks)
+    looped = bool(getattr(args, "dblock_looped", False)) and getattr(core, "dblock_loop_embed", None) is not None
+    if looped:
+        _ll = int(getattr(args, "dblock_loop_layers", 0) or 0) or max(1, len(core.blocks) // max(1, dblock_blocks))
+        _ll = max(1, min(_ll, len(core.blocks)))
+        _ls = max(0, min(int(getattr(args, "dblock_loop_start", 0) or 0), len(core.blocks) - _ll))
+        _loop_group = list(range(_ls, _ls + _ll))
+        groups = [_loop_group for _ in range(dblock_blocks)]
+    else:
+        groups = _dblock_block_layers(core, dblock_blocks)
     sigma_min = float(bsig[0])
     start = float(getattr(args, "euler_start_sigma", 0.0) or 0.0)
     if start <= 0.0:
@@ -7630,10 +7703,10 @@ def _dblock_euler_hidden(core, ids, args):
             s_cur, s_next = sched[i], sched[i + 1]
             b = _dblock_select_block(s_cur, bsig)
             sig_t = torch.full((ids.size(0),), s_cur, device=ids.device, dtype=z.dtype)
-            D = _edm_denoise_block(core, groups[b], z, sig_t, mask, args)
+            D = _edm_denoise_block(core, groups[b], z, sig_t, mask, args, block_idx=(b if looped else None))
             z = z + ((s_next - s_cur) / s_cur) * (z - D)
         sig0 = torch.full((ids.size(0),), sigma_min, device=ids.device, dtype=z.dtype)
-        D0 = _edm_denoise_block(core, groups[0], z, sig0, mask, args)
+        D0 = _edm_denoise_block(core, groups[0], z, sig0, mask, args, block_idx=(0 if looped else None))
         return core.ln(D0)
 
 
@@ -7766,6 +7839,7 @@ def infer(args):
     sat_head_mlp = bool(sd.get("sat_head_mlp", False) or _sat_head_mlp_from_state(sd))
     sat_h = SATHead(cfg["d"], mlp=sat_head_mlp, tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
     nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device) if ("nat" in sd or args.mode == "nat") else None
+    _maybe_register_looped_infer(core, sd, args)
     core.load_state_dict(_prepare_core_state_dict_for_load(core, sd["core"]))
     ar_h.load_state_dict(sd["ar"])
     _load_infer_head_state(sat_h, sd["sat"], "SATHead")
@@ -8739,6 +8813,14 @@ def main():
     tr.add_argument("--loss_spike_skip", type=float, default=0.0,
                     help="Skip the optimizer step when the mean raw CE exceeds this multiple of its EMA (dblock path). 0 disables. ~3.0 drops pathological noisy-batch spikes.")
     tr.add_argument("--dblock", action="store_true", help="DiffusionBlocks block-wise denoising training (low VRAM).")
+    tr.add_argument("--dblock_looped", action="store_true",
+                    help="Experimental opt-in recurrent-depth DBlock mode: reuse one shared physical layer group across all sigma bands with a learned loop-index embedding. Single sampled band per step, no BPTT. Default off.")
+    tr.add_argument("--dblock_loop_layers", type=int, default=0,
+                    help="Number of physical layers in the shared looped DBlock group. 0 chooses layers/dblock_blocks.")
+    tr.add_argument("--dblock_loop_start", type=int, default=0,
+                    help="First physical layer index for the shared looped DBlock group.")
+    tr.add_argument("--dblock_loop_cond_scale", type=float, default=1.0,
+                    help="Scale for the learned loop-index embedding added at shared block entry.")
     tr.add_argument("--auto_dblock_search", action="store_true", help="Auto-search block configs")
     tr.add_argument("--dblock_blocks", type=int, default=4, help="Partition layers into this many DiffusionBlocks blocks.")
     tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "loss_balanced"], default="loss_balanced",

@@ -204,6 +204,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as _ck
 
+# Optional CuPy hook for future AGILLM agents.
+# Keep the main trainer on PyTorch CUDA: autograd, AMP, SDPA, MoE, and DBlock
+# losses are already torch-native. This helper is deliberately lazy and disabled
+# by default so importing the trainer never depends on CuPy or CUDA toolkit
+# headers. Use it only for side/offline NumPy-heavy, non-autograd helpers such as
+# checkpoint/delta diagnostics, custom array probes, or preprocessing experiments.
+_CUPY_DISABLED = object()
+_OPTIONAL_CUPY = _CUPY_DISABLED
+
+
+def _optional_cupy_backend(reason=""):
+    """Return cupy when AGILLM_ENABLE_CUPY=1, otherwise None.
+
+    CuPy is useful for large NumPy-style array work on CUDA/ROCm hosts, but it is
+    not a replacement for torch in the AGILLM4.3 training hot path. Callers must
+    keep data on the GPU and avoid CPU<->GPU ping-pong. On Vast CUDA images, CuPy
+    may need CUDA_PATH=/usr/local/cuda so elementwise kernels can find headers.
+    """
+    global _OPTIONAL_CUPY
+    import os as _os
+
+    if _os.environ.get("AGILLM_ENABLE_CUPY", "0") != "1":
+        return None
+    if _OPTIONAL_CUPY is _CUPY_DISABLED:
+        if not _os.environ.get("CUDA_PATH") and _os.path.exists("/usr/local/cuda"):
+            _os.environ["CUDA_PATH"] = "/usr/local/cuda"
+        try:
+            import cupy as _cp  # type: ignore
+            _OPTIONAL_CUPY = _cp
+            label = f" for {reason}" if reason else ""
+            print(f"[cupy] optional backend enabled{label}: cupy={_cp.__version__}", flush=True)
+        except Exception as exc:
+            _OPTIONAL_CUPY = None
+            print(f"[cupy] optional backend unavailable: {type(exc).__name__}: {exc}", flush=True)
+    return _OPTIONAL_CUPY
+
 SD = 0.5
 
 

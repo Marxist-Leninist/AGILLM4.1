@@ -1427,9 +1427,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         _t = _profile_tic(prof)
         with M.amp(args.amp):
             nat_in = nat_ids.clone()
-            m = torch.rand(nat_ids.shape, device=nat_ids.device) < ratio
-            if not bool(m.any()):
-                m[..., -1] = True
+            m = M._nat_corruption_mask(nat_ids, ratio, args)
             if nat_mode in {"visible", "mask_plus_noise"}:
                 clean_hn = core.emb(nat_ids)
                 if nat_mode == "mask_plus_noise":
@@ -1439,7 +1437,11 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
                     hn = clean_hn.clone()
                 nat_noise = sig[:, None, None].to(clean_hn.dtype) * nat_noise_scale * torch.randn_like(clean_hn)
                 hn = hn.clone()
-                hn[m] = (clean_hn + nat_noise)[m]
+                # mask_plus_noise must not leak the clean target embedding at masked
+                # positions. The old code used clean_hn + noise, so training saw the
+                # answer token while inference only has BLANK slots.
+                noise_base = clean_hn if nat_mode == "visible" else hn
+                hn[m] = (noise_base + nat_noise)[m]
             else:
                 nat_in[m] = M.BLANK
                 hn = core.emb(nat_in)
@@ -6517,6 +6519,47 @@ def _nat_ids_for_training(ids: torch.Tensor, max_tokens: int) -> torch.Tensor:
         return ids[:, -max_tokens:]
     return ids
 
+
+def _nat_span_len(T: int, ratio: float, max_tokens: int = 0) -> int:
+    target = max(1, min(T, int(round(T * max(0.01, min(0.95, float(ratio)))))))
+    hi = min(T, max(target, target * 2))
+    if max_tokens and max_tokens > 0:
+        hi = min(hi, int(max_tokens))
+    lo = max(1, min(hi, target // 2 if target > 1 else 1))
+    return random.randint(lo, hi)
+
+
+def _nat_corruption_mask(ids: torch.Tensor, ratio: float, args) -> torch.Tensor:
+    """Mask schedule for NAT CMLM training.
+
+    Random single-token holes are easy because nearby clean target tokens leak most
+    of the answer. Inference asks NAT to fill contiguous/all-BLANK future spans.
+    Mix random, contiguous, and right-suffix spans so training matches that use.
+    """
+    B, T = ids.shape
+    ratio = max(0.05, min(0.95, float(ratio)))
+    span_prob = max(0.0, min(1.0, float(getattr(args, "nat_span_mask_prob", 0.35) or 0.0)))
+    suffix_prob = max(0.0, min(1.0, float(getattr(args, "nat_suffix_mask_prob", 0.20) or 0.0)))
+    max_span = int(getattr(args, "nat_span_max_tokens", 0) or 0)
+    mask = torch.empty((B, T), device=ids.device, dtype=torch.bool)
+    for b in range(B):
+        r = random.random()
+        if r < suffix_prob:
+            row = torch.zeros((T,), device=ids.device, dtype=torch.bool)
+            n = _nat_span_len(T, ratio, max_span)
+            row[-n:] = True
+        elif r < suffix_prob + span_prob:
+            row = torch.zeros((T,), device=ids.device, dtype=torch.bool)
+            n = _nat_span_len(T, ratio, max_span)
+            start = random.randint(0, max(0, T - n))
+            row[start:start + n] = True
+        else:
+            row = torch.rand((T,), device=ids.device) < ratio
+        if not bool(row.any()):
+            row[random.randrange(T)] = True
+        mask[b] = row
+    return mask
+
 def _train_phase(
     args, phase_name: str,
     core, ar_h, sat_h, nat_h, opt, scaler,
@@ -6737,9 +6780,7 @@ def _train_phase(
                         # input. This conditions on real context and cannot collapse.
                         nat_in = nat_ids.clone()
                         ratio = min(max(float(args.nat_mask_ratio), 0.05), 0.95)
-                        mask = torch.rand(nat_in.shape, device=nat_in.device) < ratio
-                        if not bool(mask.any()):
-                            mask[..., -1] = True
+                        mask = _nat_corruption_mask(nat_ids, ratio, args)
                         nat_in[mask] = BLANK
                         h_nat = core(nat_in, None)
                         logits_nat = nat_h(h_nat)
@@ -7757,11 +7798,11 @@ def infer(args):
         if args.penalty_last_n is None: args.penalty_last_n = 200
         if args.var is None: args.var = True
     else:
-        if args.temperature is None: args.temperature = 0.8
-        if args.top_k is None: args.top_k = 50
-        if args.repetition_penalty is None: args.repetition_penalty = 1.6
-        if args.presence_penalty is None: args.presence_penalty = 0.6
-        if args.frequency_penalty is None: args.frequency_penalty = 1.0
+        if args.temperature is None: args.temperature = 0.25
+        if args.top_k is None: args.top_k = 0
+        if args.repetition_penalty is None: args.repetition_penalty = 2.0
+        if args.presence_penalty is None: args.presence_penalty = 0.8
+        if args.frequency_penalty is None: args.frequency_penalty = 1.2
         if args.penalty_last_n is None: args.penalty_last_n = 512
         if args.var is None: args.var = False
     min_new = int(getattr(args, "min_new", 0) or 0)
@@ -7988,7 +8029,8 @@ def infer(args):
                 args.frequency_penalty,
             )
             logits_pos = _suppress_eos(logits_pos, args)
-            return _sample(logits_pos, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
+            nat_greedy = bool(getattr(args, "nat_greedy", True))
+            return _sample(logits_pos, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy or nat_greedy)
 
         for p in range(passes):
             if not remaining:
@@ -8780,12 +8822,18 @@ def main():
     tr.add_argument("--sat_every", type=int, default=1,
                     help="Train SAT every N steps. Default 1 keeps AR+SAT every step.")
     tr.add_argument("--nat_every", type=int, default=1,
-                    help="Train NAT every N steps with a CTC objective. Default 1 keeps AR+SAT+NAT every step.")
+                    help="Train NAT every N steps with a mask-predict objective. Default 1 keeps AR+SAT+NAT every step.")
     tr.add_argument("--nat_loss_weight", type=float, default=1.0)
     tr.add_argument("--nat_expand", type=int, default=2,
-                    help="Repeat tokens this many times for the NAT CTC input length.")
+                    help="Legacy NAT expansion factor; retained for checkpoint/script compatibility.")
     tr.add_argument("--nat_max_tokens", type=int, default=0,
                     help="Optional cap for NAT target tokens per batch; 0 uses the whole block.")
+    tr.add_argument("--nat_span_mask_prob", type=float, default=0.35,
+                    help="NAT CMLM probability of replacing random holes with one contiguous masked span.")
+    tr.add_argument("--nat_suffix_mask_prob", type=float, default=0.20,
+                    help="NAT CMLM probability of training on a right-suffix masked span, matching generation.")
+    tr.add_argument("--nat_span_max_tokens", type=int, default=0,
+                    help="Maximum NAT contiguous/suffix span length; 0 derives it from --nat_mask_ratio.")
     tr.add_argument("--dblock_nat_embed_noise_mode", choices=["off", "visible", "mask_plus_noise"], default="mask_plus_noise",
                     help="NAT embedding noise mode. off=standard BLANK masking. visible=add noise to clean embeddings. mask_plus_noise=BLANK mask + noise on masked positions.")
     tr.add_argument("--dblock_nat_embed_noise_scale", type=float, default=1.0,
@@ -8961,7 +9009,9 @@ def main():
                      default=DEFAULT_SUBLINEAR_POOLED_LANDMARKS)
     inf.add_argument("--no_structured_masks", action="store_true")
     inf.add_argument("--nat_expand", type=int, default=2)
-    inf.add_argument("--nat_passes", type=int, default=1)
+    inf.add_argument("--nat_passes", type=int, default=4)
+    inf.add_argument("--nat_greedy", action=argparse.BooleanOptionalAction, default=True,
+                     help="Use greedy token picks inside NAT mask-predict refinement by default.")
     inf.add_argument("--ignore_eos", action="store_true",
                      help="Never stop on (or sample) EOS: suppress its logit and emit exactly max_new tokens. For base-model / SAT-head testing.")
     # ── SwiReasoning: entropy-gated explicit/latent AR decode ──────────────────

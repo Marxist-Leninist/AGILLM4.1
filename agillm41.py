@@ -204,42 +204,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as _ck
 
-# Optional CuPy hook for future AGILLM agents.
-# Keep the main trainer on PyTorch CUDA: autograd, AMP, SDPA, MoE, and DBlock
-# losses are already torch-native. This helper is deliberately lazy and disabled
-# by default so importing the trainer never depends on CuPy or CUDA toolkit
-# headers. Use it only for side/offline NumPy-heavy, non-autograd helpers such as
-# checkpoint/delta diagnostics, custom array probes, or preprocessing experiments.
-_CUPY_DISABLED = object()
-_OPTIONAL_CUPY = _CUPY_DISABLED
-
-
-def _optional_cupy_backend(reason=""):
-    """Return cupy when AGILLM_ENABLE_CUPY=1, otherwise None.
-
-    CuPy is useful for large NumPy-style array work on CUDA/ROCm hosts, but it is
-    not a replacement for torch in the AGILLM4.3 training hot path. Callers must
-    keep data on the GPU and avoid CPU<->GPU ping-pong. On Vast CUDA images, CuPy
-    may need CUDA_PATH=/usr/local/cuda so elementwise kernels can find headers.
-    """
-    global _OPTIONAL_CUPY
-    import os as _os
-
-    if _os.environ.get("AGILLM_ENABLE_CUPY", "0") != "1":
-        return None
-    if _OPTIONAL_CUPY is _CUPY_DISABLED:
-        if not _os.environ.get("CUDA_PATH") and _os.path.exists("/usr/local/cuda"):
-            _os.environ["CUDA_PATH"] = "/usr/local/cuda"
-        try:
-            import cupy as _cp  # type: ignore
-            _OPTIONAL_CUPY = _cp
-            label = f" for {reason}" if reason else ""
-            print(f"[cupy] optional backend enabled{label}: cupy={_cp.__version__}", flush=True)
-        except Exception as exc:
-            _OPTIONAL_CUPY = None
-            print(f"[cupy] optional backend unavailable: {type(exc).__name__}: {exc}", flush=True)
-    return _OPTIONAL_CUPY
-
 SD = 0.5
 
 
@@ -847,28 +811,6 @@ def _dblock_init(core, args):
         "loss_ema": [None for _ in range(B)],
         "last_seen": [-1 for _ in range(B)],
     })
-    if bool(getattr(args, "dblock_looped", False)):
-        loop_layers = int(getattr(args, "dblock_loop_layers", 0) or 0)
-        if loop_layers <= 0:
-            loop_layers = max(1, L // max(1, B))
-        loop_layers = max(1, min(loop_layers, L))
-        loop_start = max(0, min(int(getattr(args, "dblock_loop_start", 0) or 0), L - loop_layers))
-        loop_group = list(range(loop_start, loop_start + loop_layers))
-        if not hasattr(core, "dblock_loop_embed"):
-            d = int(getattr(core.emb, "embedding_dim", 0))
-            core.dblock_loop_embed = nn.Embedding(B, d).to(core.emb.weight.device)
-            nn.init.normal_(core.dblock_loop_embed.weight, mean=0.0, std=0.02)
-        state.update({
-            "looped": True,
-            "loop_group": loop_group,
-            "loop_layers": loop_layers,
-            "loop_start": loop_start,
-        })
-        print(
-            f"[dblock-looped] enabled: shared_layers={loop_group} bands={B} "
-            f"unrolled_depth={loop_layers * B} one-band-per-step no_bptt=True",
-            flush=True,
-        )
     _dblock_router_boot(state, args, ctx_dim=int(getattr(core.emb, "embedding_dim", 0)) or None)
     return state
 
@@ -1211,38 +1153,6 @@ def _dblock_checkpoint_this_layer(args, base_enabled, layer_pos, layer_count=Non
     return (pos % stride) == 0
 
 
-def _dblock_loop_condition(core, h, block_idx, args):
-    emb = getattr(core, "dblock_loop_embed", None)
-    if emb is None:
-        return h
-    idx = torch.tensor([int(block_idx)], device=h.device, dtype=torch.long)
-    cond = emb(idx).to(dtype=h.dtype).view(1, 1, -1)
-    return h + float(getattr(args, "dblock_loop_cond_scale", 1.0) or 0.0) * cond
-
-
-def _maybe_register_looped_infer(core, sd, args):
-    """Looped checkpoints carry 'dblock_loop_embed.weight' in their core state.
-    Recreate the matching embedding on the inference core (so the strict core load
-    accepts it) and flip args into looped mode so the EDM block-chain decodes
-    through the single shared looped group with loop-index conditioning."""
-    core_sd = sd.get("core") if isinstance(sd, dict) else None
-    if not isinstance(core_sd, dict):
-        return
-    w = core_sd.get("dblock_loop_embed.weight")
-    if w is None:
-        return
-    bands = int(w.shape[0])
-    d = int(getattr(core.emb, "embedding_dim", 0)) or int(w.shape[1])
-    if not hasattr(core, "dblock_loop_embed"):
-        core.dblock_loop_embed = nn.Embedding(bands, d).to(core.emb.weight.device)
-    try:
-        setattr(args, "dblock_looped", True)
-        setattr(args, "dblock_blocks", bands)
-    except Exception:
-        pass
-    print("[dblock-looped] inference: shared looped group, bands=%d" % bands, flush=True)
-
-
 def _sample_token_loss_inputs(hidden, targets, max_tokens):
     max_tokens = int(max_tokens or 0)
     if max_tokens <= 0:
@@ -1309,8 +1219,6 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     bi = _choose_block(state, args)
     lo, hi = sorted([bs[bi], bs[bi + 1]])
     layers = asg[bi]
-    if state.get("looped", False):
-        layers = state.get("loop_group") or layers
     sig = _sample_sigma(ids, lo, hi, args, state)
     cs, co, ci = _edm_pre(sig)
     w = _edm_w(sig, float(getattr(args, "dblock_edm_wmax", 5.0)))
@@ -1348,7 +1256,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         with M.amp(args.amp):
             emb = core.emb(ids)
             zt = emb + sig[:, None, None] * torch.randn_like(emb)
-            h = _dblock_loop_condition(core, ci * zt, bi, args) if state.get("looped", False) else ci * zt
+            h = ci * zt
             for lpos, li in enumerate(layers):
                 mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
                 h = _run_block(core.blocks[li], h, causal, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
@@ -1377,7 +1285,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         with M.amp(args.amp):
             emb2 = core.emb(ids)
             zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
-            h2 = _dblock_loop_condition(core, ci * zt2, bi, args) if state.get("looped", False) else ci * zt2
+            h2 = ci * zt2
             for lpos, li in enumerate(layers):
                 mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
                 h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
@@ -1427,7 +1335,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         _t = _profile_tic(prof)
         with M.amp(args.amp):
             nat_in = nat_ids.clone()
-            m = M._nat_corruption_mask(nat_ids, ratio, args)
+            m = torch.rand(nat_ids.shape, device=nat_ids.device) < ratio
+            if not bool(m.any()):
+                m[..., -1] = True
             if nat_mode in {"visible", "mask_plus_noise"}:
                 clean_hn = core.emb(nat_ids)
                 if nat_mode == "mask_plus_noise":
@@ -1437,16 +1347,10 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
                     hn = clean_hn.clone()
                 nat_noise = sig[:, None, None].to(clean_hn.dtype) * nat_noise_scale * torch.randn_like(clean_hn)
                 hn = hn.clone()
-                # mask_plus_noise must not leak the clean target embedding at masked
-                # positions. The old code used clean_hn + noise, so training saw the
-                # answer token while inference only has BLANK slots.
-                noise_base = clean_hn if nat_mode == "visible" else hn
-                hn[m] = (noise_base + nat_noise)[m]
+                hn[m] = (clean_hn + nat_noise)[m]
             else:
                 nat_in[m] = M.BLANK
                 hn = core.emb(nat_in)
-            if state.get("looped", False):
-                hn = _dblock_loop_condition(core, hn, bi, args)
             for lpos, li in enumerate(layers):
                 mode = _dblock_sublayer_mode_for_layer(args, state, bi, lpos)
                 hn = _run_block(core.blocks[li], hn, None, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args, mode)
@@ -4589,10 +4493,8 @@ class Encoder(nn.Module):
         else:
             self.anchor = None
 
-    def forward(self, ids, mask, kv_caches=None, use_cache=False, total_seq_len=None, inputs_embeds=None):
-        # SwiReasoning: latent steps inject a continuous thought vector instead of a
-        # discrete token embedding. inputs_embeds is [B, T, d].
-        x = self.emb(ids) if inputs_embeds is None else inputs_embeds
+    def forward(self, ids, mask, kv_caches=None, use_cache=False, total_seq_len=None):
+        x = self.emb(ids)
         if not use_cache:
             for i, blk in enumerate(self.blocks):
                 if self.grad_checkpoint and self.training:
@@ -5350,7 +5252,7 @@ def _fuse_legacy_qkv_optimizer_state(opt_state: dict, opt, core, ar_h, sat_h, na
 
     return {"state": new_states, "param_groups": new_groups}
 
-def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str, delta_codec: str = "zstd3", provenance=None, origin_tag: str = "", dt_tag: str = "", role_tag: str = ""):
+def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str, delta_codec: str = "zstd3", provenance=None):
     """Save weight-only delta in background thread. Non-blocking."""
     global _delta_thread
     # Wait for any previous delta write to finish
@@ -5376,7 +5278,7 @@ def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pat
                 batch_size=0, block_size=0, checkpoint_type="delta"))
     except Exception:
         pass
-    path = save_dir / f"{phase_name}_delta_step{step:08d}{origin_tag}{dt_tag}{role_tag}.pt"
+    path = save_dir / f"{phase_name}_delta_step{step:08d}.pt"
     _delta_thread = threading.Thread(target=_do_delta_save, args=(tensors, path, meta, delta_codec), daemon=True)
     _delta_thread.start()
 
@@ -5916,14 +5818,14 @@ def _side_update_move(path: pathlib.Path, directory: pathlib.Path) -> pathlib.Pa
         shutil.move(str(path), str(dest))
     return dest
 
-def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> tuple[list[dict], list[dict]]:
+def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> list[dict]:
     update_dir_s = str(getattr(args, "async_update_dir", "") or "").strip()
     alpha = float(getattr(args, "async_update_alpha", 1.0) or 0.0)
     if not update_dir_s or alpha <= 0.0:
-        return [], []
+        return []
     update_dir = pathlib.Path(update_dir_s)
     if not update_dir.exists():
-        return [], []
+        return []
     max_updates = max(1, int(getattr(args, "async_update_max_per_check", 1) or 1))
     max_age = float(getattr(args, "async_update_max_age_sec", 0.0) or 0.0)
     accepted_dir = pathlib.Path(getattr(args, "async_update_accepted_dir", "") or (update_dir.parent / "accepted"))
@@ -5932,7 +5834,6 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> tu
     buffer_map = dict(core.named_buffers())
     now = time.time()
     applied: list[dict] = []
-    rejected: list[dict] = []
     candidates = sorted(
         [p for p in update_dir.glob("*.pt") if p.is_file() and not p.name.endswith(".tmp")],
         key=lambda p: p.stat().st_mtime,
@@ -6002,103 +5903,18 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> tu
                 dest = _side_update_move(path, rejected_dir)
             except Exception:
                 dest = path
-            err = reject_reason or str(exc)
             print(
                 json.dumps(
                     {
                         "event": "async_side_update_rejected",
                         "step": step,
                         "path": str(dest),
-                        "error": err,
+                        "error": reject_reason or str(exc),
                     }
                 ),
                 flush=True,
             )
-            try:
-                upd_partial = _agillm43_load_pt(dest, map_location="cpu", weights_only=False) if dest.exists() else {}
-            except Exception:
-                upd_partial = {}
-            rejected.append({
-                "path": str(dest),
-                "worker_id": upd_partial.get("worker_id"),
-                "block_id": upd_partial.get("block_id"),
-                "layers": upd_partial.get("layers"),
-                "error": err,
-            })
-    return applied, rejected
-
-# ── HF federation dataset logging ─────────────────────────────────────────────
-_HF_FED_UPDATES_REPO = "OpenTransformer/AGILLM-4.3-fed-updates"
-_HF_FED_ROUNDS_REPO  = "OpenTransformer/AGILLM-4.3-fed-rounds"
-
-def _hf_fed_log_rows_bg(repo_id: str, rows: list, step: int) -> None:
-    """Append JSONL rows to an HF dataset repo in a fire-and-forget background thread."""
-    if not rows:
-        return
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if not token:
-        return
-    try:
-        from huggingface_hub import HfApi
-    except ImportError:
-        return
-
-    def _upload():
-        try:
-            api = HfApi(token=token)
-            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            fname = f"data/{step:08d}-{ts}-{os.getpid()}.jsonl"
-            content = "\n".join(json.dumps(r, separators=(",", ":")) for r in rows) + "\n"
-            api.upload_file(
-                path_or_fileobj=content.encode(),
-                path_in_repo=fname,
-                repo_id=repo_id,
-                repo_type="dataset",
-                commit_message=f"fed log step {step}",
-            )
-        except Exception as exc:
-            print(f"[hf-fed-log] {repo_id} upload failed: {exc}", flush=True)
-
-    threading.Thread(target=_upload, daemon=True).start()
-
-
-def _hf_fed_log_side_updates(applied: list, rejected: list, step: int) -> None:
-    """Log accepted/rejected side-updates to HF AGILLM-4.3-fed-updates."""
-    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    rows = []
-    for rec in applied:
-        rows.append({
-            "ts_utc": ts, "step": step, "status": "accepted",
-            "worker_id": rec.get("worker_id"), "block_id": rec.get("block_id"),
-            "layers": rec.get("layers"), "tokens": rec.get("tokens"),
-            "tok_per_sec": rec.get("tok_per_sec"), "alpha": rec.get("alpha"),
-            "keys": rec.get("keys"), "update_mode": rec.get("update_mode"),
-            "block_codec": rec.get("block_codec"),
-        })
-    for rec in rejected:
-        rows.append({
-            "ts_utc": ts, "step": step, "status": "rejected",
-            "worker_id": rec.get("worker_id"), "block_id": rec.get("block_id"),
-            "layers": rec.get("layers"), "tokens": None,
-            "tok_per_sec": None, "alpha": None, "keys": None,
-            "update_mode": None, "block_codec": None,
-            "error": rec.get("error"),
-        })
-    _hf_fed_log_rows_bg(_HF_FED_UPDATES_REPO, rows, step)
-
-
-def _hf_fed_log_round(step: int, seen_tok: int, loss: float, role_tag: str, origin_tag: str) -> None:
-    """Log a delta-save event (federation round boundary) to HF AGILLM-4.3-fed-rounds."""
-    row = {
-        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "step": step,
-        "seen_tok": int(seen_tok),
-        "loss": round(float(loss), 6),
-        "role_tag": role_tag,
-        "origin_tag": origin_tag,
-    }
-    _hf_fed_log_rows_bg(_HF_FED_ROUNDS_REPO, [row], step)
-# ── end HF federation dataset logging ─────────────────────────────────────────
+    return applied
 
 def _optimizer_param_groups(core, ar_h, sat_h, lr_core: float, lr_head: float, nat_h=None):
     # Shared/tied vocab projections must appear in only one optimizer group.
@@ -6270,15 +6086,6 @@ def _oom_backoff_signature(args, block: int) -> Dict[str, Any]:
         "attn_backend": str(getattr(args, "attn_backend", "")),
         "grad_checkpoint": bool(getattr(args, "grad_checkpoint", False)),
         "dblock": bool(getattr(args, "dblock", False)),
-                    "dblock_blocks": int(getattr(args, "dblock_blocks", 0) or 0),
-                    "dblock_ar_prob": float(getattr(args, "dblock_ar_prob", 0.0) or 0.0),
-                    "dblock_sat_prob": float(getattr(args, "dblock_sat_prob", 0.0) or 0.0),
-                    "dblock_nat_prob": float(getattr(args, "dblock_nat_prob", 0.0) or 0.0),
-                    "sat_every": int(getattr(args, "sat_every", 0) or 0),
-                    "nat_every": int(getattr(args, "nat_every", 0) or 0),
-                    "oom_auto_backoff": bool(getattr(args, "oom_auto_backoff", False)),
-                    "ckpt_codec": str(getattr(args, "ckpt_codec", "") or ""),
-                    "delta_codec": str(getattr(args, "delta_codec", "") or ""),
         "dblock_blocks": int(getattr(args, "dblock_blocks", 0) or 0),
         "dblock_checkpoint_stride": int(getattr(args, "dblock_checkpoint_stride", 1) or 0),
         "dblock_checkpoint_skip_tail": int(getattr(args, "dblock_checkpoint_skip_tail", 0) or 0),
@@ -6519,47 +6326,6 @@ def _nat_ids_for_training(ids: torch.Tensor, max_tokens: int) -> torch.Tensor:
         return ids[:, -max_tokens:]
     return ids
 
-
-def _nat_span_len(T: int, ratio: float, max_tokens: int = 0) -> int:
-    target = max(1, min(T, int(round(T * max(0.01, min(0.95, float(ratio)))))))
-    hi = min(T, max(target, target * 2))
-    if max_tokens and max_tokens > 0:
-        hi = min(hi, int(max_tokens))
-    lo = max(1, min(hi, target // 2 if target > 1 else 1))
-    return random.randint(lo, hi)
-
-
-def _nat_corruption_mask(ids: torch.Tensor, ratio: float, args) -> torch.Tensor:
-    """Mask schedule for NAT CMLM training.
-
-    Random single-token holes are easy because nearby clean target tokens leak most
-    of the answer. Inference asks NAT to fill contiguous/all-BLANK future spans.
-    Mix random, contiguous, and right-suffix spans so training matches that use.
-    """
-    B, T = ids.shape
-    ratio = max(0.05, min(0.95, float(ratio)))
-    span_prob = max(0.0, min(1.0, float(getattr(args, "nat_span_mask_prob", 0.35) or 0.0)))
-    suffix_prob = max(0.0, min(1.0, float(getattr(args, "nat_suffix_mask_prob", 0.20) or 0.0)))
-    max_span = int(getattr(args, "nat_span_max_tokens", 0) or 0)
-    mask = torch.empty((B, T), device=ids.device, dtype=torch.bool)
-    for b in range(B):
-        r = random.random()
-        if r < suffix_prob:
-            row = torch.zeros((T,), device=ids.device, dtype=torch.bool)
-            n = _nat_span_len(T, ratio, max_span)
-            row[-n:] = True
-        elif r < suffix_prob + span_prob:
-            row = torch.zeros((T,), device=ids.device, dtype=torch.bool)
-            n = _nat_span_len(T, ratio, max_span)
-            start = random.randint(0, max(0, T - n))
-            row[start:start + n] = True
-        else:
-            row = torch.rand((T,), device=ids.device) < ratio
-        if not bool(row.any()):
-            row[random.randrange(T)] = True
-        mask[b] = row
-    return mask
-
 def _train_phase(
     args, phase_name: str,
     core, ar_h, sat_h, nat_h, opt, scaler,
@@ -6652,12 +6418,6 @@ def _train_phase(
     last_delta_mono = last_save_mono
     last_heartbeat_mono = time.monotonic()
     _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="startup")
-    # Derive origin tag from warmstart path for checkpoint naming
-    _ws_path = getattr(args, "warmstart_from", None) or getattr(args, "resume", None) or ""
-    _ws_m = re.search(r"step(\d+)", pathlib.Path(_ws_path).name) if _ws_path else None
-    _origin_tag = f"_from{int(_ws_m.group(1)):08d}" if _ws_m else ""
-    _role_tag = f"_{getattr(args, 'ckpt_role', '').strip()}" if getattr(args, "ckpt_role", "").strip() else ""
-
     if val_batches:
         _run_validation(core, ar_h, val_batches, args, step)
     print(f"[{phase_name}] Starting. Goal: {total_tokens_needed:,} tokens. Batch={BATCH}, Block={BLOCK}")
@@ -6780,7 +6540,9 @@ def _train_phase(
                         # input. This conditions on real context and cannot collapse.
                         nat_in = nat_ids.clone()
                         ratio = min(max(float(args.nat_mask_ratio), 0.05), 0.95)
-                        mask = _nat_corruption_mask(nat_ids, ratio, args)
+                        mask = torch.rand(nat_in.shape, device=nat_in.device) < ratio
+                        if not bool(mask.any()):
+                            mask[..., -1] = True
                         nat_in[mask] = BLANK
                         h_nat = core(nat_in, None)
                         logits_nat = nat_h(h_nat)
@@ -6872,7 +6634,7 @@ def _train_phase(
         pbar.update(toks_processed)
         async_every = int(getattr(args, "async_update_every_steps", 0) or 0)
         if async_every > 0 and (step % async_every) == 0:
-            _hf_fed_log_side_updates(*_apply_async_side_updates(core, cfg, args, step), step)
+            _apply_async_side_updates(core, cfg, args, step)
         empty_cache_every = int(getattr(args, "empty_cache_every_steps", 0) or 0)
         if DEV.type == "cuda" and empty_cache_every > 0 and (step % empty_cache_every) == 0:
             try:
@@ -6911,15 +6673,6 @@ def _train_phase(
                         "key": str(oom_key),
                     },
                     "dblock": bool(getattr(args, "dblock", False)),
-                    "dblock_blocks": int(getattr(args, "dblock_blocks", 0) or 0),
-                    "dblock_ar_prob": float(getattr(args, "dblock_ar_prob", 0.0) or 0.0),
-                    "dblock_sat_prob": float(getattr(args, "dblock_sat_prob", 0.0) or 0.0),
-                    "dblock_nat_prob": float(getattr(args, "dblock_nat_prob", 0.0) or 0.0),
-                    "sat_every": int(getattr(args, "sat_every", 0) or 0),
-                    "nat_every": int(getattr(args, "nat_every", 0) or 0),
-                    "oom_auto_backoff": bool(getattr(args, "oom_auto_backoff", False)),
-                    "ckpt_codec": str(getattr(args, "ckpt_codec", "") or ""),
-                    "delta_codec": str(getattr(args, "delta_codec", "") or ""),
                     "structured_masks": bool(use_structured_masks(args)),
                     "device": str(DEV),
                     "save_dir": str(args.save_dir),
@@ -6982,7 +6735,7 @@ def _train_phase(
                 _flush_sentinel.unlink()
             except FileNotFoundError:
                 pass
-            _ck_name = f"{phase_name}_step{step:08d}{_origin_tag}{time.strftime('_%Y%m%dT%H%MZ', time.gmtime())}{_role_tag}.pt"
+            _ck_name = f"{phase_name}_step{step:08d}.pt"
             _flush_delta()
             _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-flush-save")
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
@@ -7010,7 +6763,7 @@ def _train_phase(
         if _save_sec > 0:
             now_mono = time.monotonic()
             if now_mono - last_save_mono >= _save_sec:
-                ck_name = f"{phase_name}_step{step:08d}{_origin_tag}{time.strftime('_%Y%m%dT%H%MZ', time.gmtime())}{_role_tag}.pt"
+                ck_name = f"{phase_name}_step{step:08d}.pt"
                 _flush_delta()  # wait for any in-flight delta before full save
                 _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-save")
                 _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
@@ -7057,10 +6810,9 @@ def _train_phase(
                 warmstart_source_provenance=provenance_cache,
                 dataset_provenance=dataset_meta, lane=phase_name or "",
                 checkpoint_type="delta")
-            save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"), provenance=_delta_prov, origin_tag=_origin_tag, dt_tag=time.strftime("_%Y%m%dT%H%MZ", time.gmtime()), role_tag=_role_tag)
+            save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"), provenance=_delta_prov)
             last_delta_step = step
             last_delta_mono = now_mono
-            _hf_fed_log_round(step, seen_tok, loss_value, _role_tag, _origin_tag)
         if args.auto_grow:
             steps_since_last_grow += 1
             if steps_since_last_grow >= args.grow_every_steps:
@@ -7170,11 +6922,6 @@ def train(args):
     ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV)
     sat_h = SATHead(cfg["d"], mode="var", tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV)
     nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV) if use_nat_head else None
-    if bool(getattr(args, "dblock_looped", False)):
-        loop_bands = max(1, int(getattr(args, "dblock_blocks", 4) or 4))
-        core.dblock_loop_embed = nn.Embedding(loop_bands, int(cfg["d"])).to(DEV)
-        nn.init.normal_(core.dblock_loop_embed.weight, mean=0.0, std=0.02)
-        print(f"[dblock-looped] registered loop-index embedding: bands={loop_bands} dim={int(cfg['d'])}", flush=True)
     total_params = _count_enabled_params(core, ar_h, sat_h, nat_h)
     print(f"Total parameters: {total_params:,}")
     if tie_weights:
@@ -7346,92 +7093,6 @@ def _sample(logits, T, top_k, top_p, min_p, greedy):
     if min_p > 0: probs[probs < min_p] = 0
     if probs.sum() == 0: return logits.argmax(-1, keepdim=True)
     return probs.div_(probs.sum()).multinomial(1)
-
-
-def _swi_entropy(probs):
-    """Shannon entropy (nats) of a [B, V] distribution, averaged over batch."""
-    p = probs.clamp_min(1e-12)
-    return float(-(p * p.log()).sum(-1).mean())
-
-
-def _swi_soft_embed(core, probs, top_k):
-    """Continuous 'thought' = probability-weighted average of token embeddings.
-
-    The model's next-token belief stays in superposition in hidden space rather
-    than collapsing to one discrete token. Restricting to top-k mass keeps it sharp.
-    """
-    E = core.emb.weight                                    # [V, d]
-    if top_k and 0 < top_k < probs.size(-1):
-        v, i = torch.topk(probs, top_k, dim=-1)           # [B, k]
-        v = v / v.sum(-1, keepdim=True).clamp_min(1e-12)
-        thought = (v.unsqueeze(-1) * E[i]).sum(1)          # [B, d]
-    else:
-        thought = probs.to(E.dtype) @ E                    # [B, d]
-    return thought.unsqueeze(1).to(E.dtype)                # [B, 1, d]
-
-
-def _swireasoning_decode(core, ar_h, ids, args, min_new):
-    """Training-free SwiReasoning decode for the AR path.
-
-    Alternates between two reasoning regimes, gated by next-token entropy:
-      EXPLICIT — sample a real token (model thinks out loud).
-      LATENT   — inject a continuous thought embedding and emit NO token; model
-                 reasons silently in hidden space (token-efficient).
-
-    Policy: diffuse / rising entropy → drop into latent to explore in superposition;
-    low / sharply-falling entropy → switch back to explicit to consolidate.
-    --swi_max_switches and --swi_think_budget cap overthinking.
-    """
-    use_struct = use_structured_masks(args)
-    seq_len = ids.size(1)
-    h, kvs = core(ids, causal_mask(seq_len, structured=use_struct),
-                  use_cache=True, total_seq_len=seq_len)
-    mode = "latent" if getattr(args, "swi_start_latent", False) else "explicit"
-    switches = latent_run = think_steps = emitted = 0
-    prev_H = None
-    n_latent = n_explicit = 0
-    while emitted < args.max_new and think_steps < args.swi_max_steps:
-        logits_last = ar_h(h)[:, -1].float()
-        probs_raw = (logits_last / max(args.temperature, 1e-8)).softmax(-1)
-        H = _swi_entropy(probs_raw)
-        dH = 0.0 if prev_H is None else (H - prev_H)
-        prev_H = H
-
-        thinking = think_steps < args.swi_think_budget
-        if thinking and switches < args.swi_max_switches:
-            if mode == "latent":
-                if (H < args.swi_explicit_thresh or dH < -args.swi_eps
-                        or latent_run >= args.swi_max_latent):
-                    mode, switches, latent_run = "explicit", switches + 1, 0
-            else:
-                if H > args.swi_latent_thresh and dH > args.swi_eps:
-                    mode, switches = "latent", switches + 1
-        else:
-            mode = "explicit"
-
-        if mode == "latent":
-            thought = _swi_soft_embed(core, probs_raw, args.swi_topk)
-            seq_len += 1; think_steps += 1; latent_run += 1; n_latent += 1
-            h, kvs = core(None, None, kv_caches=kvs, use_cache=True,
-                          total_seq_len=seq_len, inputs_embeds=thought)
-            continue
-
-        logits = _apply_penalties(logits_last, ids, args.penalty_last_n,
-                                  args.repetition_penalty, args.presence_penalty,
-                                  args.frequency_penalty)
-        logits = _suppress_eos(logits, args, emitted < min_new)
-        nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
-        ids = torch.cat([ids, nxt], 1)
-        emitted += 1; think_steps += 1; n_explicit += 1
-        if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
-            break
-        seq_len += 1
-        h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=seq_len)
-    saved = (n_latent / max(1, n_latent + n_explicit)) * 100.0
-    print(f"[swi] explicit={n_explicit} latent={n_latent} switches={switches} "
-          f"({saved:.0f}% of reasoning steps emitted no token)")
-    return ids
-
 
 def _dblock_block_layers(core, dblock_blocks):
     L = len(core.blocks)
@@ -7691,11 +7352,9 @@ def _block_stream_forward_cached(core, ids, mask, kv_caches, total_seq_len, args
     return core.ln(x), new_kvs
 
 
-def _edm_denoise_block(core, layers, z, sigma_t, mask, args, block_idx=None):
+def _edm_denoise_block(core, layers, z, sigma_t, mask, args):
     cs, co, ci = _edm_pre(sigma_t)
     h = ci * z
-    if block_idx is not None and getattr(core, "dblock_loop_embed", None) is not None:
-        h = _dblock_loop_condition(core, h, block_idx, args)
     if _block_stream_enabled(args):
         device = _block_stream_compute_device(args)
         for li in layers:
@@ -7720,15 +7379,7 @@ def _dblock_euler_hidden(core, ids, args):
     dblock_blocks = int(getattr(args, "dblock_blocks", 4) or 4)
     steps = max(dblock_blocks, int(getattr(args, "euler_steps", 0) or (dblock_blocks * 2)))
     bsig = _block_sigmas(dblock_blocks, *_dblock_sigma_config(args))
-    looped = bool(getattr(args, "dblock_looped", False)) and getattr(core, "dblock_loop_embed", None) is not None
-    if looped:
-        _ll = int(getattr(args, "dblock_loop_layers", 0) or 0) or max(1, len(core.blocks) // max(1, dblock_blocks))
-        _ll = max(1, min(_ll, len(core.blocks)))
-        _ls = max(0, min(int(getattr(args, "dblock_loop_start", 0) or 0), len(core.blocks) - _ll))
-        _loop_group = list(range(_ls, _ls + _ll))
-        groups = [_loop_group for _ in range(dblock_blocks)]
-    else:
-        groups = _dblock_block_layers(core, dblock_blocks)
+    groups = _dblock_block_layers(core, dblock_blocks)
     sigma_min = float(bsig[0])
     start = float(getattr(args, "euler_start_sigma", 0.0) or 0.0)
     if start <= 0.0:
@@ -7744,10 +7395,10 @@ def _dblock_euler_hidden(core, ids, args):
             s_cur, s_next = sched[i], sched[i + 1]
             b = _dblock_select_block(s_cur, bsig)
             sig_t = torch.full((ids.size(0),), s_cur, device=ids.device, dtype=z.dtype)
-            D = _edm_denoise_block(core, groups[b], z, sig_t, mask, args, block_idx=(b if looped else None))
+            D = _edm_denoise_block(core, groups[b], z, sig_t, mask, args)
             z = z + ((s_next - s_cur) / s_cur) * (z - D)
         sig0 = torch.full((ids.size(0),), sigma_min, device=ids.device, dtype=z.dtype)
-        D0 = _edm_denoise_block(core, groups[0], z, sig0, mask, args, block_idx=(0 if looped else None))
+        D0 = _edm_denoise_block(core, groups[0], z, sig0, mask, args)
         return core.ln(D0)
 
 
@@ -7798,11 +7449,11 @@ def infer(args):
         if args.penalty_last_n is None: args.penalty_last_n = 200
         if args.var is None: args.var = True
     else:
-        if args.temperature is None: args.temperature = 0.25
-        if args.top_k is None: args.top_k = 0
-        if args.repetition_penalty is None: args.repetition_penalty = 2.0
-        if args.presence_penalty is None: args.presence_penalty = 0.8
-        if args.frequency_penalty is None: args.frequency_penalty = 1.2
+        if args.temperature is None: args.temperature = 0.8
+        if args.top_k is None: args.top_k = 50
+        if args.repetition_penalty is None: args.repetition_penalty = 1.6
+        if args.presence_penalty is None: args.presence_penalty = 0.6
+        if args.frequency_penalty is None: args.frequency_penalty = 1.0
         if args.penalty_last_n is None: args.penalty_last_n = 512
         if args.var is None: args.var = False
     min_new = int(getattr(args, "min_new", 0) or 0)
@@ -7880,7 +7531,6 @@ def infer(args):
     sat_head_mlp = bool(sd.get("sat_head_mlp", False) or _sat_head_mlp_from_state(sd))
     sat_h = SATHead(cfg["d"], mlp=sat_head_mlp, tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
     nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device) if ("nat" in sd or args.mode == "nat") else None
-    _maybe_register_looped_infer(core, sd, args)
     core.load_state_dict(_prepare_core_state_dict_for_load(core, sd["core"]))
     ar_h.load_state_dict(sd["ar"])
     _load_infer_head_state(sat_h, sd["sat"], "SATHead")
@@ -7962,14 +7612,7 @@ def infer(args):
     if (block_stream or resident_dtype) and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     start = time.time()
-    if args.mode == "ar" and getattr(args, "swi_reasoning", False):
-        if getattr(args, "block_stream", False) or getattr(args, "sampler", "ar") == "euler":
-            print("[swi] --swi_reasoning needs plain KV decode "
-                  "(no --block_stream / --sampler euler); falling back to standard AR.")
-            args.swi_reasoning = False
-    if args.mode == "ar" and getattr(args, "swi_reasoning", False):
-        ids = _swireasoning_decode(core, ar_h, ids, args, min_new)
-    elif args.mode == "ar":
+    if args.mode == "ar":
         _euler = getattr(args, "sampler", "ar") == "euler"
         block_stream_kv = block_stream and _block_stream_kv_cache_enabled(args)
         kvs = None
@@ -8029,8 +7672,7 @@ def infer(args):
                 args.frequency_penalty,
             )
             logits_pos = _suppress_eos(logits_pos, args)
-            nat_greedy = bool(getattr(args, "nat_greedy", True))
-            return _sample(logits_pos, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy or nat_greedy)
+            return _sample(logits_pos, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
 
         for p in range(passes):
             if not remaining:
@@ -8537,7 +8179,7 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
         "--save_dir", str(save_dir), "--save_every_sec", prof.get("save_every_sec", "14400"), "--heartbeat_every_sec", "300",
         "--empty_cache_every_steps", "0", "--delta_every_steps", "0", "--delta_every_sec", str(DEFAULT_DELTA_SEC), "--delta_max_keep", "1", "--max_ckpts", "1",
-        "--async_update_dir", incoming, "--async_update_every_steps", os.environ.get("AGILLM43_ASYNC_UPDATE_EVERY_STEPS", "50"), "--async_update_alpha", os.environ.get("AGILLM43_ASYNC_UPDATE_ALPHA", "0.10"),
+        "--async_update_dir", incoming, "--async_update_every_steps", "100", "--async_update_alpha", "0.05",
         "--async_update_max_per_check", "2", "--async_update_max_age_sec", "86400",
         "--async_update_accepted_dir", accepted, "--async_update_rejected_dir", rejected,
     ]
@@ -8808,8 +8450,6 @@ def main():
     tr.add_argument("--resume", type=str)
     tr.add_argument("--x2", action="store_true")
     tr.add_argument("--warmstart_from", type=str)
-    tr.add_argument("--ckpt_role", type=str, default="",
-                    help="Federation role tag embedded in checkpoint filenames (e.g. master, lease, coordinator). Empty = no tag.")
     tr.add_argument("--fresh", action="store_true")
     tr.add_argument("--max_ckpts", type=int, default=2)
     tr.add_argument("--chilla_max_double", action="store_true")
@@ -8822,18 +8462,12 @@ def main():
     tr.add_argument("--sat_every", type=int, default=1,
                     help="Train SAT every N steps. Default 1 keeps AR+SAT every step.")
     tr.add_argument("--nat_every", type=int, default=1,
-                    help="Train NAT every N steps with a mask-predict objective. Default 1 keeps AR+SAT+NAT every step.")
+                    help="Train NAT every N steps with a CTC objective. Default 1 keeps AR+SAT+NAT every step.")
     tr.add_argument("--nat_loss_weight", type=float, default=1.0)
     tr.add_argument("--nat_expand", type=int, default=2,
-                    help="Legacy NAT expansion factor; retained for checkpoint/script compatibility.")
+                    help="Repeat tokens this many times for the NAT CTC input length.")
     tr.add_argument("--nat_max_tokens", type=int, default=0,
                     help="Optional cap for NAT target tokens per batch; 0 uses the whole block.")
-    tr.add_argument("--nat_span_mask_prob", type=float, default=0.35,
-                    help="NAT CMLM probability of replacing random holes with one contiguous masked span.")
-    tr.add_argument("--nat_suffix_mask_prob", type=float, default=0.20,
-                    help="NAT CMLM probability of training on a right-suffix masked span, matching generation.")
-    tr.add_argument("--nat_span_max_tokens", type=int, default=0,
-                    help="Maximum NAT contiguous/suffix span length; 0 derives it from --nat_mask_ratio.")
     tr.add_argument("--dblock_nat_embed_noise_mode", choices=["off", "visible", "mask_plus_noise"], default="mask_plus_noise",
                     help="NAT embedding noise mode. off=standard BLANK masking. visible=add noise to clean embeddings. mask_plus_noise=BLANK mask + noise on masked positions.")
     tr.add_argument("--dblock_nat_embed_noise_scale", type=float, default=1.0,
@@ -8861,14 +8495,6 @@ def main():
     tr.add_argument("--loss_spike_skip", type=float, default=0.0,
                     help="Skip the optimizer step when the mean raw CE exceeds this multiple of its EMA (dblock path). 0 disables. ~3.0 drops pathological noisy-batch spikes.")
     tr.add_argument("--dblock", action="store_true", help="DiffusionBlocks block-wise denoising training (low VRAM).")
-    tr.add_argument("--dblock_looped", action="store_true",
-                    help="Experimental opt-in recurrent-depth DBlock mode: reuse one shared physical layer group across all sigma bands with a learned loop-index embedding. Single sampled band per step, no BPTT. Default off.")
-    tr.add_argument("--dblock_loop_layers", type=int, default=0,
-                    help="Number of physical layers in the shared looped DBlock group. 0 chooses layers/dblock_blocks.")
-    tr.add_argument("--dblock_loop_start", type=int, default=0,
-                    help="First physical layer index for the shared looped DBlock group.")
-    tr.add_argument("--dblock_loop_cond_scale", type=float, default=1.0,
-                    help="Scale for the learned loop-index embedding added at shared block entry.")
     tr.add_argument("--auto_dblock_search", action="store_true", help="Auto-search block configs")
     tr.add_argument("--dblock_blocks", type=int, default=4, help="Partition layers into this many DiffusionBlocks blocks.")
     tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "loss_balanced"], default="loss_balanced",
@@ -9009,32 +8635,9 @@ def main():
                      default=DEFAULT_SUBLINEAR_POOLED_LANDMARKS)
     inf.add_argument("--no_structured_masks", action="store_true")
     inf.add_argument("--nat_expand", type=int, default=2)
-    inf.add_argument("--nat_passes", type=int, default=4)
-    inf.add_argument("--nat_greedy", action=argparse.BooleanOptionalAction, default=True,
-                     help="Use greedy token picks inside NAT mask-predict refinement by default.")
+    inf.add_argument("--nat_passes", type=int, default=1)
     inf.add_argument("--ignore_eos", action="store_true",
                      help="Never stop on (or sample) EOS: suppress its logit and emit exactly max_new tokens. For base-model / SAT-head testing.")
-    # ── SwiReasoning: entropy-gated explicit/latent AR decode ──────────────────
-    inf.add_argument("--swi_reasoning", action="store_true",
-                     help="Enable SwiReasoning: alternate between explicit token CoT and silent latent reasoning, gated by next-token entropy. AR + plain KV decode only.")
-    inf.add_argument("--swi_latent_thresh", type=float, default=2.5,
-                     help="Entropy (nats) above which an explicit step switches to latent (low confidence -> think silently).")
-    inf.add_argument("--swi_explicit_thresh", type=float, default=1.0,
-                     help="Entropy (nats) below which a latent step switches back to explicit (high confidence -> consolidate out loud).")
-    inf.add_argument("--swi_eps", type=float, default=0.05,
-                     help="Min entropy delta (nats) to count as a confidence trend when deciding to switch.")
-    inf.add_argument("--swi_max_switches", type=int, default=8,
-                     help="Max latent<->explicit switches during thinking phase. After budget is spent decoder stays explicit.")
-    inf.add_argument("--swi_max_latent", type=int, default=16,
-                     help="Max consecutive latent steps before forcing back to explicit.")
-    inf.add_argument("--swi_think_budget", type=int, default=256,
-                     help="Total reasoning steps (latent+explicit) allowed to switch; after this stays explicit to finish.")
-    inf.add_argument("--swi_max_steps", type=int, default=4096,
-                     help="Hard cap on total think_steps (latent+explicit) before stopping.")
-    inf.add_argument("--swi_topk", type=int, default=20,
-                     help="Top-k mass to use for the soft thought embedding in latent steps.")
-    inf.add_argument("--swi_start_latent", action="store_true",
-                     help="Begin in latent mode instead of explicit (starts silent).")
     inf.add_argument("--infer_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
                      help="Resident inference dtype. fp16/bf16 load on CPU, convert, then move the model to CUDA to avoid fp32 VRAM spikes.")
     inf.add_argument("--block_stream", action="store_true",
